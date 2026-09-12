@@ -1,0 +1,62 @@
+{
+  "2": {
+    "inputs": {
+      "model": "FlashVSR-v1.1",
+      "mode": "tiny",
+      "scale": 2,
+      "tiled_vae": true,
+      "tiled_dit": true,
+      "unload_dit": false,
+      "seed": 439836404324088,
+      "frames": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "FlashVSRNode",
+    "_meta": {
+      "title": "FlashVSR Ultra-Fast"
+    }
+  },
+  "5": {
+    "inputs": {
+      "video": "s3MA5dZMkGeChXxJwpMMX_minimax-h3.mp4",
+      "force_rate": 0,
+      "custom_width": 0,
+      "custom_height": 0,
+      "frame_load_cap": 0,
+      "skip_first_frames": 0,
+      "select_every_nth": 1,
+      "format": "AnimateDiff"
+    },
+    "class_type": "VHS_LoadVideo",
+    "_meta": {
+      "title": "Load Video (Upload) 🎥🅥🅗🅢"
+    }
+  },
+  "6": {
+    "inputs": {
+      "frame_rate": 30,
+      "loop_count": 0,
+      "filename_prefix": "AnimateDiff",
+      "format": "video/h265-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "2",
+        0
+      ],
+      "audio": [
+        "5",
+        2
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Video Combine 🎥🅥🅗🅢"
+    }
+  }
+}

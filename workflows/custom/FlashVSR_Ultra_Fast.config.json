@@ -1,0 +1,36 @@
+{
+  "title": "custom/FlashVSR_Ultra_Fast",
+  "fields": [
+    {
+      "id": "f_4qnbmyl",
+      "node": "5",
+      "input": "video",
+      "name": "video",
+      "type": "video",
+      "default": "s3MA5dZMkGeChXxJwpMMX_minimax-h3.mp4",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false
+    }
+  ],
+  "mini_cards": {
+    "prompt": {
+      "x": 24,
+      "y": 30
+    },
+    "image": {
+      "x": 24,
+      "y": 210
+    },
+    "custom": {
+      "x": 280,
+      "y": 78
+    },
+    "output": {
+      "x": 540,
+      "y": 120
+    }
+  }
+}
