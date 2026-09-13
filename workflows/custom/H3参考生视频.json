@@ -1,0 +1,346 @@
+{
+  "1": {
+    "inputs": {
+      "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "2": {
+    "inputs": {
+      "image": "分镜图02_四人双打关系.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "3": {
+    "inputs": {
+      "lora_name": "minimax_h3_turbo_4step_comfyui_pruned.safetensors",
+      "strength_model": 0.75,
+      "model": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA加载器（仅模型）"
+    }
+  },
+  "4": {
+    "inputs": {
+      "noise_seed": 781236837815354
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "随机噪波"
+    }
+  },
+  "5": {
+    "inputs": {
+      "scheduler": "beta",
+      "steps": 6,
+      "denoise": 1,
+      "model": [
+        "20",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "基本调度器"
+    }
+  },
+  "6": {
+    "inputs": {
+      "processing_control_value": 0.085,
+      "processing_percent_1": 0.1,
+      "processing_percent_2": 0.9,
+      "mcs": 1,
+      "device": "auto",
+      "cache_depth": 0.75,
+      "model": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "TESpeedMiniMaxH3",
+    "_meta": {
+      "title": "TE-Speed-MiniMaxH3 (OSS)"
+    }
+  },
+  "7": {
+    "inputs": {
+      "model": [
+        "20",
+        0
+      ],
+      "conditioning": [
+        "19",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "基本引导器"
+    }
+  },
+  "8": {
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_int4_convrot.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "加载CLIP"
+    }
+  },
+  "9": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "10": {
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "11": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "K采样器选择"
+    }
+  },
+  "12": {
+    "inputs": {
+      "fp16_safe": true,
+      "tau": 0.75,
+      "start_percent": 0.2,
+      "end_percent": 0.9,
+      "min_tokens": 1024,
+      "dense_blocks": "0-1,-1",
+      "h3_prefix_tokens": 1024,
+      "topk_blocks": 32,
+      "debug_nan": false,
+      "profile": false,
+      "model": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "SolAttnV100",
+    "_meta": {
+      "title": "Sol-Attn (V100)"
+    }
+  },
+  "13": {
+    "inputs": {
+      "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17",
+      "values.a": [
+        "21",
+        0
+      ]
+    },
+    "class_type": "ComfyMathExpression",
+    "_meta": {
+      "title": "数学表达式"
+    }
+  },
+  "14": {
+    "inputs": {
+      "text": "subject_definitions:\n<Subject 1>: Heroine swordswoman, black combat kimono with crimson lining, white hair ribbon, single jade dao, determined sharp eyes, consistent facial features, cel-shaded anime style\n<Subject 2>: Rival swordswoman, dark purple cyber-yukata, glowing red eyes, twin short blades, silver hair strands, aggressive posture, consistent character design\n<Subject 3>: Ruined night market street, crumbling wooden stalls, broken paper lanterns, wet asphalt, neon signs, distant pagoda ruins, floating smoke and rain\n<Picture 1>: Reference for 2D anime cinematic action look, cel-shaded animation, high-saturation bold flat colors, sharp ink speed lines, manga impact frames, motion blur on blade trails, dramatic rim lighting\nsummary:\n[reference generation][2D anime cinematic][16s][action fight] Two rival swordswomen clash in a ruined neon night market, using fast iaido-style sword draws, blade afterimages, and explosive manga impact cuts, with a tense taiko and electronic drum build.\nretention_analysis:\n<Picture 1>: fully_preserved 2D cel-shaded anime action aesthetic, high-saturation flat colors, ink speed lines, manga impact frames, dramatic rim lighting; only replace the shrine setting and rewrite the fight choreography\n<Subject 1>: retain swordswoman identity and jade dao, adjust costume to black combat kimono with crimson lining\n<Subject 2>: retain rival swordswoman identity, adjust weapon to twin short blades\n<Subject 3>: replace ruined shrine with ruined neon night market street\ndetailed_description:\nTotal duration: 16 seconds, 2D anime cinematic action look, cel-shaded animation, high-saturation bold flat colors, sharp ink speed lines, manga impact frames, motion blur on blade trails, dramatic rim lighting, vivid neon twilight sky over a ruined night market.\n\n[0s-2s] Wide low-angle shot. Rain falls on a ruined night market street. Broken paper lanterns swing above crumbling wooden stalls. Wet asphalt reflects red, blue and purple neon signs. <Subject 1> and <Subject 2> land on opposite sides of a shattered food stall. Both swords are drawn low. Dust and rain splash upward. They lock eyes. Twin blades hum faintly.\n\n[2s-4s] Heroine rockets forward with a low iaido dash. Her jade dao leaves a bright green blade trail. The rival backflips off a collapsing stall roof, then meets her mid-air with a horizontal twin-blade strike. One brutal clash creates a circular shockwave ring. Lantern glass shatters nearby.\n\n[4s-6s] Mid-air spinning exchange. Three quick cuts: over-shoulder shot, low ground shot, profile shot. Five clashing hits land in fast succession. Each impact triggers a manga starburst flash, thick ink speed lines, and sparkling metal fragments. The camera tilts sharply with every strike.\n\n[6s-8s] Rival delivers a flying knee strike to the heroine’s ribs. The heroine crashes through a wooden lantern stall. Paper and wood debris explodes outward. She skids across the wet street, leaving a long water trail. Her lip bleeds slightly, but she keeps one hand on her jade dao.\n\n[8s-10s] Heroine rises slowly in the rain. She wipes blood from her chin with the back of her hand. Her eyes narrow. The jade dao cracks faintly along the blade, then reforms with a brighter cyan-green glow. A charged aura wraps around her sword arm. Neon light reflects intensely in her pupils.\n\n[10s-13s] Both fighters blur forward again. The heroine’s jade dao locks against the rival’s twin short blades. Energy sparks cascade downward through smoke and rain. The camera pushes close to the weapons. Blade trails twist like glowing ribbons. The taiko drum and electronic beat reach a sharp peak.\n\n[13s-16s] Rival breaks the lock and disarms one of her own short blades as a feint. The blade spins through the rain. The heroine catches the falling short blade mid-spin, now wielding both jade dao and the stolen short blade. She slashes upward, creating a green-and-red cross-shaped slash effect. The last frame freezes on her battle grin, with rain, neon and floating debris behind her.\n\noverall_soundscape:\nContinuous metal clashing, sharp \"klang\" impacts, whooshing wind, flickering sparks, rain hitting wet asphalt, breaking wood and paper, distant neon hum.\nnon_diegetic_music:\nTense taiko drum build combined with dark electronic bass, sharp string stabs, and a final dramatic hit at the freeze frame.."
+    },
+    "class_type": "Text",
+    "_meta": {
+      "title": "文本"
+    }
+  },
+  "15": {
+    "inputs": {
+      "samples": [
+        "17",
+        0
+      ],
+      "vae": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudio",
+    "_meta": {
+      "title": "VAE解码（音频）"
+    }
+  },
+  "16": {
+    "inputs": {
+      "samples": [
+        "17",
+        0
+      ],
+      "vae": [
+        "9",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "17": {
+    "inputs": {
+      "noise": [
+        "4",
+        0
+      ],
+      "guider": [
+        "7",
+        0
+      ],
+      "sampler": [
+        "11",
+        0
+      ],
+      "sigmas": [
+        "5",
+        0
+      ],
+      "latent_image": [
+        "19",
+        1
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "自定义采样器（高级）"
+    }
+  },
+  "18": {
+    "inputs": {
+      "frame_rate": 24,
+      "loop_count": 0,
+      "filename_prefix": "HD",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "16",
+        0
+      ],
+      "audio": [
+        "15",
+        0
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "合并为视频"
+    }
+  },
+  "19": {
+    "inputs": {
+      "prompt": "",
+      "width": [
+        "22",
+        0
+      ],
+      "height": [
+        "22",
+        1
+      ],
+      "length": [
+        "13",
+        1
+      ],
+      "ref_image_size": "match",
+      "clip": [
+        "8",
+        0
+      ],
+      "vae": [
+        "9",
+        0
+      ],
+      "audio_vae": [
+        "10",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "2",
+        0
+      ],
+      "ref_audios.ref_audio_0": [
+        "23",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3ReferenceToVideo",
+    "_meta": {
+      "title": "MiniMax H3 Reference to Video"
+    }
+  },
+  "20": {
+    "inputs": {
+      "shift_video": 12,
+      "shift_audio": 3,
+      "model": [
+        "12",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "ModelSamplingMiniMaxH3"
+    }
+  },
+  "21": {
+    "inputs": {
+      "value": 5
+    },
+    "class_type": "PrimitiveFloat",
+    "_meta": {
+      "title": "秒"
+    }
+  },
+  "22": {
+    "inputs": {
+      "aspect_ratio": "16:9 (Widescreen)",
+      "megapixels": 0.4,
+      "multiple": 32
+    },
+    "class_type": "ResolutionSelector",
+    "_meta": {
+      "title": "分辨率选择器"
+    }
+  },
+  "23": {
+    "inputs": {
+      "audio": "HD_00011-audio.mp4"
+    },
+    "class_type": "LoadAudio",
+    "_meta": {
+      "title": "加载音频"
+    }
+  }
+}

@@ -55,6 +55,30 @@
           "type": "image",
           "items": [
             {
+              "id": "asset_58f6d7acb4f8",
+              "name": "workflow-custom_1789275830_b8c266885d",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_052c1d9cc51f_workflow-custom_1789275830_b8c266885d.mp4",
+              "kind": "video",
+              "created_at": 1789275839903,
+              "registrations": {}
+            },
+            {
+              "id": "asset_84618cc93150",
+              "name": "workflow-custom_1789275164_1005046df9",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_d9ab85d686ae_workflow-custom_1789275164_1005046df9.mp4",
+              "kind": "video",
+              "created_at": 1789275172099,
+              "registrations": {}
+            },
+            {
+              "id": "asset_d87d214bf09e",
+              "name": "workflow-custom_1789273521_a964ca9229",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_815af65fb9fe_workflow-custom_1789273521_a964ca9229.mp4",
+              "kind": "video",
+              "created_at": 1789273532878,
+              "registrations": {}
+            },
+            {
               "id": "asset_c953566cea7b",
               "name": "workflow-custom_1789271437_a1e1cde29d",
               "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_c0bc653bd9e8_workflow-custom_1789271437_a1e1cde29d.mp4",
@@ -206,6 +230,30 @@
       "type": "image",
       "items": [
         {
+          "id": "asset_58f6d7acb4f8",
+          "name": "workflow-custom_1789275830_b8c266885d",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_052c1d9cc51f_workflow-custom_1789275830_b8c266885d.mp4",
+          "kind": "video",
+          "created_at": 1789275839903,
+          "registrations": {}
+        },
+        {
+          "id": "asset_84618cc93150",
+          "name": "workflow-custom_1789275164_1005046df9",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_d9ab85d686ae_workflow-custom_1789275164_1005046df9.mp4",
+          "kind": "video",
+          "created_at": 1789275172099,
+          "registrations": {}
+        },
+        {
+          "id": "asset_d87d214bf09e",
+          "name": "workflow-custom_1789273521_a964ca9229",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_815af65fb9fe_workflow-custom_1789273521_a964ca9229.mp4",
+          "kind": "video",
+          "created_at": 1789273532878,
+          "registrations": {}
+        },
+        {
           "id": "asset_c953566cea7b",
           "name": "workflow-custom_1789271437_a1e1cde29d",
           "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_c0bc653bd9e8_workflow-custom_1789271437_a1e1cde29d.mp4",
@@ -305,5 +353,5 @@
       "dir": "生成图片"
     }
   ],
-  "updated_at": 1789271448858
+  "updated_at": 1789275839903
 }

@@ -1,0 +1,318 @@
+{
+  "1": {
+    "inputs": {
+      "frame_rate": 24,
+      "loop_count": 0,
+      "filename_prefix": "HD",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "8",
+        0
+      ],
+      "audio": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "合并为视频"
+    }
+  },
+  "2": {
+    "inputs": {
+      "noise_seed": 611414064294113
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "随机噪波"
+    }
+  },
+  "3": {
+    "inputs": {
+      "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17",
+      "values.a": [
+        "18",
+        0
+      ]
+    },
+    "class_type": "ComfyMathExpression",
+    "_meta": {
+      "title": "数学表达式"
+    }
+  },
+  "4": {
+    "inputs": {
+      "prompt": [
+        "16",
+        0
+      ],
+      "width": [
+        "14",
+        0
+      ],
+      "height": [
+        "14",
+        1
+      ],
+      "length": [
+        "3",
+        1
+      ],
+      "clip": [
+        "11",
+        0
+      ],
+      "vae": [
+        "12",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3ImageToVideo",
+    "_meta": {
+      "title": "MiniMax H3 Image to Video"
+    }
+  },
+  "5": {
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "VAE加载器"
+    }
+  },
+  "6": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "K采样器选择"
+    }
+  },
+  "7": {
+    "inputs": {
+      "samples": [
+        "10",
+        0
+      ],
+      "vae": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudio",
+    "_meta": {
+      "title": "VAE解码_Audio"
+    }
+  },
+  "8": {
+    "inputs": {
+      "samples": [
+        "10",
+        0
+      ],
+      "vae": [
+        "12",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "9": {
+    "inputs": {
+      "model": [
+        "19",
+        0
+      ],
+      "conditioning": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "基础引导"
+    }
+  },
+  "10": {
+    "inputs": {
+      "noise": [
+        "2",
+        0
+      ],
+      "guider": [
+        "9",
+        0
+      ],
+      "sampler": [
+        "6",
+        0
+      ],
+      "sigmas": [
+        "15",
+        0
+      ],
+      "latent_image": [
+        "4",
+        1
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "自定义采样器(高级)"
+    }
+  },
+  "11": {
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_int4_convrot.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "CLIP加载器"
+    }
+  },
+  "12": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "VAE加载器"
+    }
+  },
+  "13": {
+    "inputs": {
+      "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNET加载器"
+    }
+  },
+  "14": {
+    "inputs": {
+      "aspect_ratio": "9:16 (Portrait Widescreen)",
+      "megapixels": 0.4,
+      "multiple": 32
+    },
+    "class_type": "ResolutionSelector",
+    "_meta": {
+      "title": "分辨率选择器"
+    }
+  },
+  "15": {
+    "inputs": {
+      "scheduler": "beta",
+      "steps": 6,
+      "denoise": 1,
+      "model": [
+        "19",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "基础调度器"
+    }
+  },
+  "16": {
+    "inputs": {
+      "text": "subject_definitions:\n@林听晚 is the young woman with a sharp V-shaped face, fine arched eyebrows, narrow phoenix eyes, matte red lips, a French high updo with loose strands, and round pearl earrings, wearing a white tweed jacket with crisp woven texture over a black satin slip dress with a soft pearlescent sheen, sheer black stockings, and black pointed stiletto heels.\n@周砚 is the tall man with a square jaw, thick wild eyebrows, single-eyelid narrow eyes, and a black side-parted slicked-back short hairstyle, wearing a tailored black wool suit jacket with a matte finish over a crisp white cotton shirt, black straight wool trousers, and black matte leather dress shoes.\n@乔芊 is the young woman with a heart-shaped face, soft curved eyebrows, round apricot eyes with light amber irises, peach-toned makeup, and a deep brown half-up hairstyle with air bangs, wearing a white cotton undershirt under a light pink lace A-line bridesmaid dress with hollow transparent patterns and soft draping fabric, and pink square-toe block-heel shoes.\n@酒店宴会厅后台灯光间 is the indoor lighting room doorway space with a half-open glass door showing clear reflections, a warm white ceiling light above, and a bright corridor in the background providing spatial depth.\n@手机 is the modern rectangular smartphone with a black slim body and a large high-definition glass screen displaying a video recording interface.\n@戒指 is the delicate bright silver metal wedding ring with a shiny metallic luster.\n@林听晚音色 is the voice-timbre reference for @林听晚 (S1).\n@周砚音色 is the voice-timbre reference for @周砚 (S2).\n@乔芊音色 is the voice-timbre reference for @乔芊 (S3).\n\nsummary:\n[reference generation + audio reference] The target video shows @林听晚 standing at the doorway of @酒店宴会厅后台灯光间, holding @手机 to record and questioning @周砚, who panics and tries to explain while @乔芊 pulls her hand back with @戒指 on her finger. Across three shots, the sequence uses over-the-shoulder angles for the confrontation. @林听晚音色, @周砚音色, and @乔芊音色 are the voice references for the three speakers.\n\nretention_analysis:\n@林听晚 (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - the woman's sharp V-face, fine arched eyebrows, phoenix eyes, red lips, high updo, pearl earrings, white tweed jacket, black satin slip dress, and black heels are retained.\n@周砚 (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - the man's square jaw, wild eyebrows, narrow eyes, slicked-back short hair, black wool suit, white shirt, and black leather shoes are retained.\n@乔芊 (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - the young woman's heart-shaped face, curved eyebrows, amber eyes, half-up hairstyle with air bangs, light pink lace bridesmaid dress, and pink block-heel shoes are retained.\n@酒店宴会厅后台灯光间 (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - the half-open glass door, warm white ceiling light, bright corridor, and glass reflections keep their original layout.\n@手机 (appears in [Shot 1]): fully_preserved - the black slim body and the screen displaying the recording interface are retained.\n@戒指 (appears in [Shot 1], [Shot 3]): fully_preserved - the bright silver metal wedding ring with shiny luster is retained.\n@林听晚音色: reference - it is the voice reference for @林听晚 and is not copied as a signal.\n@周砚音色: reference - it is the voice reference for @周砚 and is not copied as a signal.\n@乔芊音色: reference - it is the voice reference for @乔芊 and is not copied as a signal.\n\ndetailed_description:\nThe target video is in a Chinese 3D-animated feature style rendered with physically based shading: high-density character models, crisp material textures on silk, leather, metal and skin, hair built from separated strand clusters, soft global illumination under one clearly directional key light, and a semi-realistic finish with realistic body proportions and no cartoon exaggeration.\n[Shot 1] A medium close-up over-the-shoulder shot from behind @周砚's right shoulder. @林听晚 stands at the left side of the doorway of @酒店宴会厅后台灯光间, facing inward. She holds @手机 in her right hand, the screen displaying the recording interface. Her expression is cold and sharp, eyes narrowed, and the warm white ceiling light along with glass reflections illuminates her face and the crisp woven texture of her white tweed jacket. @周砚's black wool suit shoulder is blurred in the foreground. In the background, @周砚 turns his head toward the door with a panicked expression, and @乔芊 pulls her right hand back, her fingers still loosely holding @戒指. The camera holds a static shot. @林听晚 (S1) says at a measured, cold pace, her tone sharp and questioning: <d>[Chinese] 周砚，你给伴娘试戒指？</d>\n[Shot 2] At 00:03.000, the shot cuts to a close-up over-the-shoulder from behind @林听晚's right shoulder. The foreground blurs her white tweed jacket. The focus is on @周砚's front face. His single-eyelid narrow eyes dart in panic, his brow furrowed, and his lips move rapidly as he tries to explain. The warm indoor light casts soft contact shadows on his square jaw, and the matte finish of his black wool suit stays crisp. @林听晚's back faces the camera, her lips sealed. The camera holds a static shot. @周砚 (S2) says at a fast, slightly trembling pace, his tone anxious and pleading: <d>[Chinese] 听晚，你听我解释。</d>\n[Shot 3] At 00:06.500, the shot cuts to a close-up over-the-shoulder from behind @周砚's left shoulder. The foreground blurs his black suit shoulder. The focus is on @乔芊's side profile. Her round amber eyes are red and watery, a film of moisture gathering without spilling, and her lips part slightly as she speaks. Her right hand is still near her chest, fingers holding @戒指. The soft warm light highlights her peach-toned makeup, the separated strand clusters of her air bangs, and the hollow transparent lace patterns of her light pink bridesmaid dress. @林听晚 and @周砚 keep their lips sealed. The camera holds a static shot. @乔芊 (S3) says at a slow, trembling pace, her tone soft and aggrieved: <d>[Chinese] 晚晚，不是你想的那样。</d> From 00:09.500 to 00:10.000, all characters keep their lips sealed in a static hold.\n\noverall_soundscape:\nDistant muffled sound of a banquet hall host testing a microphone runs continuously beneath the scene, mixed with faint ambient room tone. The subtle rustle of fabric occurs as @乔芊 pulls her hand back, and the faint plastic click of @手机 being held steady is audible.\n\nnon_diegetic_music:\nN/A"
+    },
+    "class_type": "Text",
+    "_meta": {
+      "title": "文本"
+    }
+  },
+  "17": {
+    "inputs": {
+      "fp16_safe": true,
+      "tau": 0.75,
+      "start_percent": 0.2,
+      "end_percent": 0.9,
+      "min_tokens": 1024,
+      "dense_blocks": "0-1,-1",
+      "h3_prefix_tokens": 1024,
+      "topk_blocks": 32,
+      "debug_nan": false,
+      "profile": false,
+      "model": [
+        "21",
+        0
+      ]
+    },
+    "class_type": "SolAttnV100",
+    "_meta": {
+      "title": "Sol-Attn (V100)"
+    }
+  },
+  "18": {
+    "inputs": {
+      "value": 5
+    },
+    "class_type": "PrimitiveFloat",
+    "_meta": {
+      "title": "秒"
+    }
+  },
+  "19": {
+    "inputs": {
+      "shift_video": 12,
+      "shift_audio": 3,
+      "model": [
+        "17",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "ModelSamplingMiniMaxH3"
+    }
+  },
+  "20": {
+    "inputs": {
+      "lora_name": "minimax_h3_turbo_4step_comfyui_pruned.safetensors",
+      "strength_model": 0.75,
+      "model": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA加载器(仅模型)"
+    }
+  },
+  "21": {
+    "inputs": {
+      "processing_control_value": 0.085,
+      "processing_percent_1": 0.1,
+      "processing_percent_2": 0.9,
+      "mcs": 1,
+      "device": "auto",
+      "cache_depth": 0.75,
+      "model": [
+        "20",
+        0
+      ]
+    },
+    "class_type": "TESpeedMiniMaxH3",
+    "_meta": {
+      "title": "TE-Speed-MiniMaxH3 (OSS)"
+    }
+  }
+}

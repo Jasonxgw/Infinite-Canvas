@@ -1,0 +1,50 @@
+{
+  "title": "FLUX基础文生图工作流",
+  "fields": [
+    {
+      "id": "f_prompt",
+      "node": "19",
+      "input": "text",
+      "name": "提示词文本",
+      "type": "textarea",
+      "default": "一个亚洲女孩站在深秋的户外",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false
+    },
+    {
+      "id": "f_seed",
+      "node": "15",
+      "input": "noise_seed",
+      "name": "随机种子",
+      "type": "number",
+      "default": 793483344102665,
+      "min": null,
+      "max": null,
+      "step": 1.0,
+      "options": [],
+      "random_enabled": true
+    }
+  ],
+  "mini_cards": {
+    "prompt": {
+      "x": 24,
+      "y": 30
+    },
+    "image": {
+      "x": 24,
+      "y": 210
+    },
+    "custom": {
+      "x": 280,
+      "y": 78
+    },
+    "output": {
+      "x": 540,
+      "y": 120
+    }
+  },
+  "output_node": "23"
+}
