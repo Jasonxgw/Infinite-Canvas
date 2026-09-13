@@ -2504,6 +2504,16 @@ function addImageNode(point){
     const p = point || defaultPoint(-120, 0);
     return addNode({id:uid('img'), type:'image', x:p.x, y:p.y, url:'', name:'空白图片'});
 }
+function addAudioNode(point){
+    const p = point || defaultPoint(-120, 40);
+    // 音频节点复用 image 类型（画布按 mediaKind 渲染成音频卡片），用于给 ComfyUI 的参考音频等输入提供音频
+    return addNode({id:uid('img'), type:'image', x:p.x, y:p.y, url:'', name:'空白音频', mediaKind:'audio'});
+}
+function addVideoAssetNode(point){
+    const p = point || defaultPoint(-120, 80);
+    // 视频节点复用 image 类型（画布按 mediaKind 渲染成视频卡片），用于给 ComfyUI 的视频输入提供素材
+    return addNode({id:uid('img'), type:'image', x:p.x, y:p.y, url:'', name:'空白视频', mediaKind:'video'});
+}
 function addPromptNode(point){
     const p = point || defaultPoint(0, 0);
     return addNode({id:uid('prompt'), type:'prompt', x:p.x, y:p.y, text:''});
@@ -2531,11 +2541,11 @@ function addGroupNode(point){
     const p = point || defaultPoint(40, 0);
     return addNode({id:uid('grp'), type:'group', x:p.x, y:p.y, w:300, h:220, items:[]});
 }
-function pickMediaForNode(nodeId){
+function pickMediaForNode(nodeId, opts={}){
     const input = document.createElement('input');
     input.type = 'file';
-    input.accept = 'image/*,video/*,audio/*';
-    input.multiple = true;
+    input.accept = opts.accept || 'image/*,video/*,audio/*';
+    input.multiple = opts.multiple !== false;
     input.onchange = () => {
         if(input.files?.length) fillImageNode(nodeId, input.files, {group:input.files.length > 1});
     };
@@ -2609,6 +2619,10 @@ function addVideoNode(point){
         type:'video',
         x:p.x,
         y:p.y,
+        // 'api' = 云端 API 视频模型；'comfy' = 直接跑 ComfyUI 工作流
+        videoSource:'api',
+        comfyWorkflow:'',
+        comfyParams:{},
         apiProvider:providerId,
         model:models[0] || videoModels[0] || DEFAULT_VIDEO_MODELS[0],
         duration:5,
@@ -3244,6 +3258,8 @@ function linkCreateOptions(state){
     if(CANVAS_GENERATOR_TYPES.includes(node.type) || node.type === 'llm'){
         return [
             {type:'image', label:tr('canvas.imageCard'), icon:'image-plus'},
+            {type:'audio', label:tr('canvas.audioCard'), icon:'file-audio'},
+            {type:'videoAsset', label:tr('canvas.videoCard'), icon:'file-video'},
             {type:'prompt', label:tr('canvas.prompt'), icon:'text-cursor-input'},
             {type:'loop', label:tr('canvas.loopNode'), icon:'repeat-2'},
             {type:'group', label:tr('canvas.group'), icon:'group'},
@@ -3602,6 +3618,8 @@ function createLinkedNode(type){
 }
 function createNodeByType(type, point){
     if(type === 'image') return addImageNode(point);
+    if(type === 'audio') return addAudioNode(point);
+    if(type === 'videoAsset') return addVideoAssetNode(point);
     if(type === 'prompt') return addPromptNode(point);
     if(type === 'loop') return addLoopNode(point);
     if(type === 'group') return addGroupNode(point);
@@ -3620,6 +3638,8 @@ function createNodeByType(type, point){
 function menuAdd(type){
     closeCreateMenu();
     if(type === 'image') addImageNode(menuPoint);
+    if(type === 'audio') addAudioNode(menuPoint);
+    if(type === 'videoAsset') addVideoAssetNode(menuPoint);
     if(type === 'prompt') addPromptNode(menuPoint);
     if(type === 'loop') addLoopNode(menuPoint);
     if(type === 'llm') addLLMNode(menuPoint);
@@ -4218,7 +4238,9 @@ function clearImageNode(nodeId, event=null){
     scheduleSave();
 }
 function pickImageForNode(nodeId){
-    pickMediaForNode(nodeId);
+    const node = nodes.find(n => n.id === nodeId);
+    const kind = mediaKindForNode(node);
+    pickMediaForNode(nodeId, kind === 'image' ? {} : {accept:`${kind}/*`, multiple:false});
 }
 function cropBounds(){
     const img = document.getElementById('cropImage');
@@ -6151,7 +6173,7 @@ function renderNode(node){
         if(node.type === 'output') openOutputNodeMenu(node.id, e.clientX, e.clientY);
         else openGeneratorNodeMenu(node.id, e.clientX, e.clientY);
     };
-    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'minimax' ? 'MiniMax H3' : node.type === 'midjourney' ? 'Midjourney' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
+    const title = node.type === 'image' ? nodeTitleForMedia(node) : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'minimax' ? 'MiniMax H3' : node.type === 'midjourney' ? 'Midjourney' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
     const displayTitle = node.type === 'image' && node.url ? nodeTitleForMedia(node) : title;
     // 失败徽章只在一键运行模式中显示，单节点失败已通过 alert 提示
     const showStatus = ['generator','midjourney','msgen','comfy','ltxDirector','llm','video','rh','minimax'].includes(node.type) && node.runStatus
@@ -6244,7 +6266,11 @@ function renderNode(node){
                 loadedImg.onload = () => refreshGeometryAfterLayout();
             }
         } else {
-        body.innerHTML = `<div class="blank-image"><i data-lucide="image-plus" class="w-7 h-7"></i><div class="text-[11px] font-bold">${tr('canvas.clickDragPasteImage')}</div></div>`;
+        const isAudioNode = node.mediaKind === 'audio';
+        const isVideoNode = node.mediaKind === 'video';
+        const blankIcon = isAudioNode ? 'file-audio' : isVideoNode ? 'file-video' : 'image-plus';
+        const blankText = isAudioNode ? tr('canvas.clickSelectAudio') : isVideoNode ? tr('canvas.clickSelectVideo') : tr('canvas.clickDragPasteImage');
+        body.innerHTML = `<div class="blank-image"><i data-lucide="${blankIcon}" class="w-7 h-7"></i><div class="text-[11px] font-bold">${blankText}</div></div>`;
             const blank = body.querySelector('.blank-image');
             blank.onclick = () => pickImageForNode(node.id);
             blank.ondragover = e => allowImageNodeDropEvent(e, blank);
@@ -8713,19 +8739,26 @@ function renderVideoBody(node){
     const ordered = orderedSources(node, inputSources);
     const mediaInputs = ordered.filter(src => src.refs?.some(ref => ['image','video','audio'].includes(mediaKindForRef(ref))));
     const promptInputs = ordered.filter(src => src.prompt && !src.refs?.length);
-    sanitizeVideoNodeProviderModel(node);
+    const useComfy = node.videoSource === 'comfy';
+    // 走 ComfyUI 工作流时复用 comfy 节点的 custom 模式（工作流选择 + 参数 + 参考媒体注入）
+    if(useComfy) node.mode = 'custom';
+    else sanitizeVideoNodeProviderModel(node);
     node.model = node.model || 'veo3-fast';
     wrap.innerHTML = `
         <div class="prompt-list mb-3"></div>
+        <div class="mode-tabs source-tabs">
+            <button type="button" data-video-source="api" class="${useComfy ? '' : 'active'}">${tr('canvas.videoSourceApi')}</button>
+            <button type="button" data-video-source="comfy" class="${useComfy ? 'active' : ''}">${tr('canvas.videoSourceComfy')}</button>
+        </div>
         <div class="video-input-head">
             <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Media</div>
-            <div class="video-input-actions">
+            <div class="video-input-actions ${useComfy ? 'hidden' : ''}">
                 <button type="button" class="tool-btn" data-video-manual-url title="手动输入视频 URL"><i data-lucide="link" class="w-4 h-4"></i><span>输入网址</span></button>
                 <button type="button" class="tool-btn" data-video-temp-sh ${node.tempShUploading ? 'disabled' : ''} title="上传当前输入视频到云端直链"><i data-lucide="upload-cloud" class="w-4 h-4"></i><span>${node.tempShUploading ? '上传中...' : '上传云端'}</span></button>
             </div>
         </div>
         <div class="input-list video-img-list"></div>
-        <div class="gen-settings">
+        <div class="gen-settings video-api-settings ${useComfy ? 'hidden' : ''}">
             <div class="gen-settings-row">
                 <select class="select-lite video-provider" style="flex:1">${videoProviderOptions(node.apiProvider)}</select>
                 <select class="select-lite video-model" style="flex:2">${videoModelOptions(node.model, node.apiProvider)}</select>
@@ -8770,6 +8803,7 @@ function renderVideoBody(node){
                 <button type="button" class="setting-check ${node.useFrameRoles ? 'active' : ''}" data-video-toggle="useFrameRoles"><span class="check-dot"></span>${tr('canvas.videoFirstLastFrames')}</button>
             </div>
         </div>
+        <div class="gen-settings video-comfy-settings ${useComfy ? '' : 'hidden'}"></div>
         <div class="gen-run-row">
             <button class="gen-btn ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="clapperboard" class="w-4 h-4"></i>${node.running ? tr('canvas.generating') : tr('canvas.videoGenerate')}</button>
             ${cascadeBtnHtml(node)}
@@ -8839,6 +8873,22 @@ function renderVideoBody(node){
     const list = wrap.querySelector('.video-img-list');
     renderVideoImageInputs(list, node, mediaInputs);
     renderPromptPreview(wrap.querySelector('.prompt-list'), promptInputs);
+    wrap.querySelectorAll('[data-video-source]').forEach(btn => {
+        btn.onmousedown = e => e.stopPropagation();
+        btn.onclick = e => {
+            e.stopPropagation();
+            const source = btn.dataset.videoSource === 'comfy' ? 'comfy' : 'api';
+            if(node.videoSource === source) return;
+            node.videoSource = source;
+            if(source === 'comfy'){
+                if(!hasComfyWorkflow(node.comfyWorkflow) && comfyWorkflows[0]?.name) node.comfyWorkflow = comfyWorkflows[0].name;
+                if(node.comfyWorkflow && !comfyWorkflowCache[node.comfyWorkflow]) ensureComfyWorkflow(node.comfyWorkflow).then(() => render());
+            }
+            render();
+            scheduleSave();
+        };
+    });
+    if(useComfy) renderComfySettings(wrap.querySelector('.video-comfy-settings'), node);
     wrap.querySelector('.gen-btn').onclick = e => { e.stopPropagation(); runCanvasGenerate(node.id); };
     bindCascadeButtons(wrap, node.id);
     return wrap;
@@ -9491,7 +9541,7 @@ function validComfyWorkflowName(name){
 }
 function pruneMissingComfyWorkflows(){
     let changed = false;
-    nodes.filter(n => n.type === 'comfy').forEach(node => {
+    nodes.filter(n => n.type === 'comfy' || (n.type === 'video' && n.videoSource === 'comfy')).forEach(node => {
         if(node.comfyWorkflow && !hasComfyWorkflow(node.comfyWorkflow)){
             delete comfyWorkflowCache[node.comfyWorkflow];
             node.comfyWorkflow = '';
@@ -9538,9 +9588,24 @@ async function ensureRunningHubWorkflow(workflowId){
 }
 function comfyFieldKind(f){
     if(['image','video','audio'].includes(f?.type)) return f.type;
+    if(f?.bind_prompt === true) return 'prompt';
+    if(f?.bind_prompt === false) return 'setting';
     const key = `${f.input || ''} ${f.name || ''}`.toLowerCase();
     if(f.type === 'textarea' || /prompt|text|提示词|正向|负向/.test(key)) return 'prompt';
     return 'setting';
+}
+// 动态多输入（COMFY_AUTOGROW_V3）的键前缀：默认按输入名推测，ref_images -> ref_image_
+function comfyAutogrowPrefix(field, kind='image'){
+    const explicit = String(field?.prefix || '').trim();
+    if(explicit) return explicit;
+    const input = String(field?.input || '').trim().replace(/s$/i, '');
+    if(input) return `${input}_`;
+    return kind === 'audio' ? 'ref_audio_' : kind === 'video' ? 'ref_video_' : 'ref_image_';
+}
+function comfyMediaMaxItems(field, kind='image'){
+    const explicit = Number(field?.max_items);
+    if(Number.isFinite(explicit) && explicit > 0) return Math.floor(explicit);
+    return kind === 'image' ? 9 : 3;
 }
 function comfyFields(node, kind='all'){
     const data = currentComfyWorkflow(node);
@@ -9554,6 +9619,16 @@ function comfyParamValue(node, field){
 }
 function comfyRandomEnabled(field){
     return field?.type === 'number' && field.random_enabled === true;
+}
+// 标记 builtin_prompt 的文本字段（如「参考文字」）可在没有连接提示词节点时直接当提示词使用
+function comfyBuiltinPromptFields(node){
+    return (currentComfyWorkflow(node)?.config?.fields || []).filter(f => f?.builtin_prompt === true);
+}
+function comfyBuiltinPromptText(node){
+    return comfyBuiltinPromptFields(node)
+        .map(f => String(comfyParamValue(node, f) || '').trim())
+        .filter(Boolean)
+        .join('\n\n');
 }
 function comfyRandomActive(node, fieldId){
     node.comfyRandomActive = node.comfyRandomActive || {};
@@ -10870,6 +10945,193 @@ async function runRhModelNode(node, opts={}){
         showErrorModal(err.message || tr('canvas.generationFailed'), tr('canvas.apiFailed'));
     }
 }
+// ComfyUI 文本字段的 @ 引用：在 textarea 里输入 @ 可挑选画布/资产库中的图片、音频、视频，
+// 选中的素材记录在 node.comfyMentions[fieldId]，运行时作为参考媒体注入工作流。
+let comfyMentionState = null;
+let comfyMentionLibraryLoading = false;
+function comfyMentionKindLabel(kind){
+    if(langIsEn()) return {image:'Image', video:'Video', audio:'Audio'}[kind] || 'Media';
+    return {image:'图片', video:'视频', audio:'音频'}[kind] || '素材';
+}
+function comfyMentionList(node, fieldId){
+    node.comfyMentions = node.comfyMentions || {};
+    node.comfyMentions[fieldId] = node.comfyMentions[fieldId] || [];
+    return node.comfyMentions[fieldId];
+}
+function comfyMentionToken(name, list){
+    const base = String(name || '').trim().replace(/\s+/g, '_').replace(/[^\w\u4e00-\u9fa5.-]/g, '').slice(0, 24) || '素材';
+    let token = base;
+    let i = 2;
+    while((list || []).some(m => m.token === token && m.name !== name)) token = `${base}_${i++}`;
+    return token;
+}
+function comfyMentionCandidates(node){
+    const seen = new Set();
+    const out = [];
+    const add = (url, name, kind) => {
+        const value = String(url || '');
+        if(!value || seen.has(value)) return;
+        const mediaKind = kind || mediaKindForRef(value);
+        if(!['image','video','audio'].includes(mediaKind)) return;
+        seen.add(value);
+        out.push({url:value, name:String(name || '').trim() || (value.split('/').pop() || '素材'), kind:mediaKind});
+    };
+    orderedSources(node, generatorSources(node)).forEach(src => (src.refs || []).forEach(ref => add(ref.url, ref.name, ref.kind)));
+    nodes.forEach(n => {
+        if(!n || n.id === node.id) return;
+        if(n.type !== 'image' && n.type !== 'output' && n.type !== 'group' && !CANVAS_MEDIA_OUTPUT_TYPES.includes(n.type)) return;
+        mediaRefsFromNode(n).forEach(ref => add(ref.url, ref.name, ref.kind));
+    });
+    (canvasAssetLibrary?.libraries || []).forEach(lib => (lib.categories || []).forEach(cat => {
+        if(String(cat.type || '').toLowerCase() === 'workflow') return;
+        (cat.items || []).forEach(item => add(item.url, item.name, canvasAssetItemKind(item)));
+    }));
+    (localCanvasAssetLibrary?.items || []).forEach(item => add(item.url, item.name, canvasAssetItemKind(item)));
+    return out;
+}
+// 只保留仍然出现在文本里的 @ 引用，用户删掉文字后就不再注入该素材
+function comfyMentionRefsForNode(node){
+    const out = [];
+    const seen = new Set();
+    const store = node?.comfyMentions || {};
+    const fields = (currentComfyWorkflow(node)?.config?.fields || []).filter(f => f.type === 'textarea');
+    fields.forEach(f => {
+        const list = store[f.id] || [];
+        if(!list.length) return;
+        const text = String(comfyParamValue(node, f) || '');
+        list.forEach(m => {
+            if(!m?.url || !m.token || seen.has(m.url)) return;
+            if(text.indexOf(`@${m.token}`) === -1) return;
+            seen.add(m.url);
+            out.push({url:m.url, name:m.name || '', kind:m.kind || mediaKindForRef(m.url)});
+        });
+    });
+    return out;
+}
+function comfyMentionQuery(area){
+    const before = String(area.value || '').slice(0, area.selectionStart ?? 0);
+    const match = before.match(/@([^\s@]*)$/);
+    return match ? match[1] : null;
+}
+// textarea 里已成功引用的 @ 素材用蓝色高亮显示（用一层同步的镜像层渲染，textarea 文字设为透明）
+function renderComfyMentionHighlight(area){
+    const field = area?.closest('.comfy-mention-field');
+    const layer = field?.querySelector('.comfy-mention-highlight');
+    if(!field || !layer) return;
+    const text = String(area.value || '');
+    let html = escapeHtml(text);
+    if(area.__comfyNode){
+        const tokens = comfyMentionList(area.__comfyNode, area.__comfyFieldId || '')
+            .map(m => m.token).filter(Boolean)
+            .sort((a, b) => b.length - a.length);
+        if(tokens.length){
+            const pattern = tokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+            html = html.replace(new RegExp(`@(?:${pattern})`, 'g'), m => `<span class="comfy-mention-token">${m}</span>`);
+        }
+    }
+    layer.innerHTML = `${html}\n `;
+    // 让镜像层的换行宽度与 textarea 的滚动条占位保持一致
+    field.style.setProperty('--comfy-gutter', `${Math.max(0, area.offsetWidth - area.clientWidth)}px`);
+    layer.scrollTop = area.scrollTop;
+    layer.scrollLeft = area.scrollLeft;
+}
+function syncComfyMentionScroll(area){
+    const layer = area?.closest('.comfy-mention-field')?.querySelector('.comfy-mention-highlight');
+    if(!layer) return;
+    layer.scrollTop = area.scrollTop;
+    layer.scrollLeft = area.scrollLeft;
+}
+function closeComfyMentionPicker(area){
+    const picker = area?.closest('.field')?.querySelector('.comfy-mention-picker');
+    if(picker){
+        picker.hidden = true;
+        picker.innerHTML = '';
+    }
+    if(!area || comfyMentionState?.area === area) comfyMentionState = null;
+}
+function insertComfyMention(node, area, fieldId, ref){
+    const list = comfyMentionList(node, fieldId);
+    let entry = list.find(m => m.url === ref.url);
+    if(!entry){
+        entry = {url:ref.url, name:ref.name, kind:ref.kind, token:comfyMentionToken(ref.name, list)};
+        list.push(entry);
+    }
+    const value = String(area.value || '');
+    const start = area.selectionStart ?? value.length;
+    const end = area.selectionEnd ?? start;
+    const at = value.slice(0, start).match(/@([^\s@]*)$/);
+    const from = at ? start - at[0].length : start;
+    const insert = `@${entry.token} `;
+    area.value = value.slice(0, from) + insert + value.slice(end);
+    const caret = from + insert.length;
+    area.focus();
+    area.setSelectionRange(caret, caret);
+    node.comfyParams = node.comfyParams || {};
+    node.comfyParams[fieldId] = area.value;
+    renderComfyMentionHighlight(area);
+    closeComfyMentionPicker(area);
+    scheduleSave();
+    setStatus(langIsEn() ? `Referenced ${ref.name}` : `已引用 ${ref.name}`);
+}
+function renderComfyMentionPicker(node, area, fieldId){
+    const picker = area?.closest('.field')?.querySelector('.comfy-mention-picker');
+    if(!picker) return;
+    const query = comfyMentionQuery(area);
+    if(query === null){ closeComfyMentionPicker(area); return; }
+    if(!(canvasAssetLibrary?.libraries || []).length && !comfyMentionLibraryLoading){
+        comfyMentionLibraryLoading = true;
+        loadCanvasAssetLibrary({renderPanel:false}).then(() => {
+            comfyMentionLibraryLoading = false;
+            if(comfyMentionState?.area === area) renderComfyMentionPicker(node, area, fieldId);
+        }).catch(() => { comfyMentionLibraryLoading = false; });
+    }
+    const keyword = query.toLowerCase();
+    const candidates = comfyMentionCandidates(node)
+        .filter(ref => !keyword || `${ref.name} ${ref.kind} ${comfyMentionKindLabel(ref.kind)}`.toLowerCase().includes(keyword))
+        .slice(0, 30);
+    if(!candidates.length){
+        picker.hidden = false;
+        picker.innerHTML = `<div class="comfy-mention-empty">${langIsEn() ? 'No matching media' : '没有匹配的素材'}</div>`;
+        comfyMentionState = {nodeId:node.id, fieldId, area, candidates:[], active:-1};
+        return;
+    }
+    const previous = comfyMentionState?.fieldId === fieldId && comfyMentionState?.area === area ? comfyMentionState.active : 0;
+    const active = Math.min(Math.max(previous, 0), candidates.length - 1);
+    picker.hidden = false;
+    picker.innerHTML = candidates.map((ref, i) => `
+        <button type="button" class="comfy-mention-option ${i === active ? 'active' : ''}" data-mention-index="${i}">
+            <span class="comfy-mention-kind">${escapeHtml(comfyMentionKindLabel(ref.kind))}</span>
+            <span class="comfy-mention-name">${escapeHtml(ref.name)}</span>
+        </button>
+    `).join('');
+    comfyMentionState = {nodeId:node.id, fieldId, area, candidates, active};
+    picker.querySelectorAll('[data-mention-index]').forEach(btn => {
+        btn.onmousedown = e => e.preventDefault();
+        btn.onclick = e => {
+            e.preventDefault();
+            e.stopPropagation();
+            const ref = comfyMentionState?.candidates?.[Number(btn.dataset.mentionIndex)];
+            if(ref) insertComfyMention(node, area, fieldId, ref);
+        };
+    });
+}
+function handleComfyMentionKeydown(node, area, fieldId, event){
+    const state = comfyMentionState;
+    if(!state || state.area !== area || !state.candidates.length) return false;
+    if(event.key === 'ArrowDown' || event.key === 'ArrowUp'){
+        const delta = event.key === 'ArrowDown' ? 1 : -1;
+        state.active = (state.active + delta + state.candidates.length) % state.candidates.length;
+        const picker = area.closest('.field')?.querySelector('.comfy-mention-picker');
+        picker?.querySelectorAll('[data-mention-index]').forEach((btn, i) => btn.classList.toggle('active', i === state.active));
+        return true;
+    }
+    if(event.key === 'Enter' || event.key === 'Tab'){
+        const ref = state.candidates[state.active];
+        if(ref){ insertComfyMention(node, area, fieldId, ref); return true; }
+    }
+    if(event.key === 'Escape'){ closeComfyMentionPicker(area); return true; }
+    return false;
+}
 function renderComfySettings(container, node){
     const mode = node.mode || 'text';
     if(mode === 'text'){
@@ -10949,6 +11211,23 @@ function renderComfySettings(container, node){
         input.onchange = e => updateComfyField(node, input, e);
         input.oninput = e => updateComfyField(node, input, e);
     });
+    // 「参考文字」等文本字段支持 @ 引用画布/资产库里的图片、音频、视频
+    container.querySelectorAll('textarea[data-comfy-mention]').forEach(area => {
+        const fieldId = area.dataset.comfyParam || '';
+        area.__comfyNode = node;
+        area.__comfyFieldId = fieldId;
+        renderComfyMentionHighlight(area);
+        area.oninput = e => {
+            updateComfyField(node, area, e);
+            renderComfyMentionHighlight(area);
+            renderComfyMentionPicker(node, area, fieldId);
+        };
+        area.onkeydown = e => {
+            if(handleComfyMentionKeydown(node, area, fieldId, e)) e.preventDefault();
+        };
+        area.onscroll = () => syncComfyMentionScroll(area);
+        area.onblur = () => setTimeout(() => closeComfyMentionPicker(area), 150);
+    });
 }
 function renderComfyCustomField(node, f){
     const value = comfyParamValue(node, f);
@@ -10974,8 +11253,16 @@ function renderComfyCustomField(node, f){
         </div>`;
     }
     if(f.type === 'textarea'){
+        const hint = f.builtin_prompt === true
+            ? (langIsEn() ? '@ to reference media · used as prompt' : '@ 可引用素材 · 未接提示词节点时作为提示词')
+            : (langIsEn() ? '@ to reference media' : '@ 可引用素材');
         return `<div class="gen-settings-row">
-            <label class="field" style="flex:1"><div class="setting-title">${label}</div><textarea class="setting-input" data-comfy-param="${escapeHtml(f.id)}" data-comfy-type="textarea" style="height:66px;padding-top:8px;resize:vertical">${escapeHtml(value)}</textarea></label>
+            <label class="field" style="flex:1"><div class="setting-title">${label}<span class="comfy-mention-hint">${hint}</span></div>
+            <div class="comfy-mention-field">
+                <div class="comfy-mention-highlight" aria-hidden="true"></div>
+                <textarea class="setting-input comfy-mention-input" data-comfy-param="${escapeHtml(f.id)}" data-comfy-type="textarea" data-comfy-mention="1">${escapeHtml(value)}</textarea>
+            </div>
+            <div class="comfy-mention-picker" hidden></div></label>
         </div>`;
     }
     const type = f.type === 'number' ? 'number' : 'text';
@@ -11108,7 +11395,7 @@ function syncConnectedOutputsFromGenerated(node, outputs){
     outputNodesForSource(node.id).forEach(out => appendOutputImagesWithoutDuplicates(out, list));
 }
 function generatedImageRefs(node){
-    const keepGeneratedMedia = ['rh','ltxDirector','video','minimax'].includes(node?.type);
+    const keepGeneratedMedia = ['rh','ltxDirector','video','minimax','comfy'].includes(node?.type);
     return (node?.generatedOutputs || [])
         .map((item, i) => {
             const url = outputUrlValue(item);
@@ -12535,14 +12822,13 @@ async function runLTXDirectorNode(nodeId, opts={}){
             [LTX_DIRECTOR_WF_NODE]:directorInputs,
             [LTX_DIRECTOR_SEED_NODE]:{noise_seed:Number(node.noiseSeed ?? 12)}
         };
-        const result = await runQueuedComfyGenerate({
+        const result = await submitComfyTask(run, {
             prompt:globalPrompt,
             workflow_json:LTX_DIRECTOR_WORKFLOW,
             params,
             type:'ltx-director',
             client_id:CLIENT_ID
         }, {cascadeTargetId});
-        run.request = requestMetaFromResult(result);
         if(result.error) throw new Error(result.error);
         const outputs = comfyResultOutputs(result);
         if(!outputs.length) throw new Error(tr('canvas.ltxNoOutput'));
@@ -12580,18 +12866,27 @@ async function runComfyNode(nodeId, opts={}){
     if(!node || (node.running && !opts.cascade)) return;
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(node, generatorSources(node));
-    const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
-    const allRefs = sources.flatMap(s => s.refs || []);
-    const refs = imageRefsOnly(allRefs);
     const mode = node.mode || 'text';
+    // 没有连接提示词节点时，回退使用 ComfyUI 节点内置的「参考文字」等内容作为提示词
+    const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n')
+        || (mode === 'custom' ? comfyBuiltinPromptText(node) : '');
+    // 参考文字里通过 @ 引用的素材也作为参考媒体一起注入工作流
+    const allRefs = [...sources.flatMap(s => s.refs || []), ...comfyMentionRefsForNode(node)];
+    const refs = imageRefsOnly(allRefs);
     const customImageFields = mode === 'custom' ? comfyFields(node, 'image') : [];
     const customVideoFields = mode === 'custom' ? comfyFields(node, 'video') : [];
     const customAudioFields = mode === 'custom' ? comfyFields(node, 'audio') : [];
     const customPromptFields = mode === 'custom' ? comfyFields(node, 'prompt') : [];
-    if((mode === 'text' || (mode === 'custom' && customPromptFields.length)) && !prompt){ alert(tr('canvas.needPrompt')); return; }
-    if((mode !== 'text' && mode !== 'custom' && !refs.length) || (mode === 'custom' && refs.length < customImageFields.length)){ alert(tr('canvas.needImage')); return; }
-    if(mode === 'custom' && videoRefsOnly(allRefs).length < customVideoFields.length){ alert(langIsEn() ? 'Please connect enough video inputs for this ComfyUI workflow.' : '请为这个 ComfyUI 工作流连接足够的视频输入'); return; }
-    if(mode === 'custom' && audioRefsOnly(allRefs).length < customAudioFields.length){ alert(langIsEn() ? 'Please connect enough audio inputs for this ComfyUI workflow.' : '请为这个 ComfyUI 工作流连接足够的音频输入'); return; }
+    // 工作流内置的「参考文字」等文本字段（builtin_prompt）同样属于必填的文本输入。
+    const customBuiltinPromptFields = mode === 'custom' ? comfyBuiltinPromptFields(node) : [];
+    // 动态多输入字段（multi=true）没有「一字段一份媒体」的硬性下限，0 个引用时整个输入省略。
+    const requiredImageFields = customImageFields.filter(f => !f.multi).length;
+    const requiredVideoFields = customVideoFields.filter(f => !f.multi).length;
+    const requiredAudioFields = customAudioFields.filter(f => !f.multi).length;
+    if((mode === 'text' || (mode === 'custom' && (customPromptFields.length || customBuiltinPromptFields.length))) && !prompt){ alert(tr('canvas.needPrompt')); return; }
+    if((mode !== 'text' && mode !== 'custom' && !refs.length) || (mode === 'custom' && refs.length < requiredImageFields)){ alert(tr('canvas.needImage')); return; }
+    if(mode === 'custom' && videoRefsOnly(allRefs).length < requiredVideoFields){ alert(langIsEn() ? 'Please connect enough video inputs for this ComfyUI workflow.' : '请为这个 ComfyUI 工作流连接足够的视频输入'); return; }
+    if(mode === 'custom' && audioRefsOnly(allRefs).length < requiredAudioFields){ alert(langIsEn() ? 'Please connect enough audio inputs for this ComfyUI workflow.' : '请为这个 ComfyUI 工作流连接足够的音频输入'); return; }
     let out = outputForNode(node, 480);
     const pendingId = uid('p');
     const run = runSnapshot(node, prompt, refs);
@@ -12608,7 +12903,7 @@ async function runComfyNode(nodeId, opts={}){
         let images = [];
         if(mode === 'text'){
             run.taskLabel = tr('canvas.comfyText');
-            const result = await runQueuedComfyGenerate({
+            const result = await submitComfyTask(run, {
                 prompt,
                 width:Number(node.width || 1024),
                 height:Number(node.height || 1024),
@@ -12616,12 +12911,11 @@ async function runComfyNode(nodeId, opts={}){
                 type:'zimage',
                 client_id:CLIENT_ID
             }, {cascadeTargetId});
-            run.request = requestMetaFromResult(result);
             images = comfyResultOutputs(result);
         } else if(mode === 'enhance'){
             run.taskLabel = tr('canvas.comfyEnhance');
             const inputName = await comfyNameForRef(refs[0]);
-            const enhance = await runQueuedComfyGenerate({
+            const enhance = await submitComfyTask(run, {
                 workflow_json:'Z-Image-Enhance.json',
                 params:{
                     "15": { image:inputName },
@@ -12630,7 +12924,6 @@ async function runComfyNode(nodeId, opts={}){
                 type:'enhance',
                 client_id:CLIENT_ID
             }, {cascadeTargetId});
-            run.request = requestMetaFromResult(enhance);
             if(enhance.error) throw new Error(actionFailed('canvas.comfyEnhance', enhance.error));
             if(!enhance.images?.length) throw new Error(noReturnedImage('canvas.comfyEnhance'));
             if(node.enhanceUpscale){
@@ -12651,18 +12944,49 @@ async function runComfyNode(nodeId, opts={}){
             const audioFields = fields.filter(f => comfyFieldKind(f) === 'audio');
             const promptFields = fields.filter(f => comfyFieldKind(f) === 'prompt');
             const settingFields = fields.filter(f => comfyFieldKind(f) === 'setting');
-            const assignMediaFields = async (mediaFields, mediaRefs) => {
-                const names = [];
-                for(const ref of mediaRefs.slice(0, mediaFields.length)) names.push(await comfyNameForRef(ref));
-                mediaFields.forEach((f, i) => {
-                    if(!f.node || !f.input) return;
-                    params[f.node] = params[f.node] || {};
-                    params[f.node][f.input] = names[i] || '';
-                });
+            // 动态多输入需要真实的上游节点：为每个引用插入一个 LoadImage/LoadAudio 节点，
+            // 再把 {"ref_image_0":[节点,0], ...} 写回目标节点的 autogrow 输入。
+            const autogrowNodeSpec = kind => kind === 'audio'
+                ? {class_type:'LoadAudio', input:'audio', out:0}
+                : kind === 'video'
+                    ? {class_type:'LoadVideo', input:'file', out:0}
+                    : {class_type:'LoadImage', input:'image', out:0};
+            const usedNodeIds = new Set(Object.keys(wf || {}));
+            let generatedNodeSeq = 900000;
+            const allocateNodeId = () => {
+                while(usedNodeIds.has(String(generatedNodeSeq))) generatedNodeSeq += 1;
+                usedNodeIds.add(String(generatedNodeSeq));
+                return String(generatedNodeSeq);
             };
-            await assignMediaFields(imageFields, refs);
-            await assignMediaFields(videoFields, videoRefsOnly(allRefs));
-            await assignMediaFields(audioFields, audioRefsOnly(allRefs));
+            const assignMediaField = async (field, mediaRefs) => {
+                if(!field.node || !field.input) return;
+                const kind = ['audio','video'].includes(field.type) ? field.type : 'image';
+                const picked = (mediaRefs || []).slice(0, comfyMediaMaxItems(field, kind));
+                params[field.node] = params[field.node] || {};
+                if(!field.multi){
+                    const name = picked.length ? await comfyNameForRef(picked[0]) : '';
+                    params[field.node][field.input] = name || '';
+                    return;
+                }
+                // 动态多输入（COMFY_AUTOGROW_V3）按「输入名.前缀+序号」写入，例如
+                // ref_images.ref_image_0：工作流导出时自带的参考素材先清空，只按画布实际
+                // 连接的引用重建；未连接引用时该输入整体省略（不启用）。
+                Object.keys((wf?.workflow || {})?.[field.node]?.inputs || {}).forEach(key => {
+                    if(key.startsWith(`${field.input}.`)) params[field.node][key] = null;
+                });
+                const prefix = comfyAutogrowPrefix(field, kind);
+                const spec = autogrowNodeSpec(kind);
+                for(let i = 0; i < picked.length; i++){
+                    const name = await comfyNameForRef(picked[i]);
+                    if(!name) continue;
+                    const loadNodeId = allocateNodeId();
+                    params[loadNodeId] = {class_type:spec.class_type, inputs:{[spec.input]:name}};
+                    params[field.node][`${field.input}.${prefix}${i}`] = [loadNodeId, spec.out];
+                }
+            };
+            for(const f of imageFields) await assignMediaField(f, refs);
+            for(const f of videoFields) await assignMediaField(f, videoRefsOnly(allRefs));
+            for(const f of audioFields) await assignMediaField(f, audioRefsOnly(allRefs));
             promptFields.forEach(f => {
                 if(!f.node || !f.input) return;
                 params[f.node] = params[f.node] || {};
@@ -12677,14 +13001,13 @@ async function runComfyNode(nodeId, opts={}){
                 }
                 params[f.node][f.input] = comfyParamValue(node, f);
             });
-            const result = await runQueuedComfyGenerate({
+            const result = await submitComfyTask(run, {
                 prompt,
                 workflow_json:workflowName,
                 params,
                 type:'workflow-custom',
                 client_id:CLIENT_ID
             }, {cascadeTargetId});
-            run.request = requestMetaFromResult(result);
             if(result.error) throw new Error(actionFailed('canvas.comfyCustom', result.error));
             images = comfyResultOutputs(result);
             if(!images.length) throw new Error(noReturnedImage('canvas.comfyCustom'));
@@ -12692,7 +13015,7 @@ async function runComfyNode(nodeId, opts={}){
             run.taskLabel = tr('canvas.comfyEdit');
             const names = [];
             for (const ref of refs.slice(0, 3)) names.push(await comfyNameForRef(ref));
-            const result = await runQueuedComfyGenerate({
+            const result = await submitComfyTask(run, {
                 prompt,
                 workflow_json:'Flux2-Klein.json',
                 type:'klein',
@@ -12707,7 +13030,6 @@ async function runComfyNode(nodeId, opts={}){
                 },
                 client_id:CLIENT_ID
             }, {cascadeTargetId});
-            run.request = requestMetaFromResult(result);
             if(result.error) throw new Error(actionFailed('canvas.comfyEdit', result.error));
             if(!result.images?.length) throw new Error(noReturnedImage('canvas.comfyEdit'));
             images = node.editUpscale ? await runComfyUpscale(result.images?.[0], node.editUpscaleRes || 2048, {cascadeTargetId}) : result.images || [];
@@ -12878,7 +13200,14 @@ function runCascadeNodeByType(node, opts={}){
     if(node.type === 'comfy') return runComfyNode(node.id, runOpts);
     if(node.type === 'ltxDirector') return runLTXDirectorNode(node.id, runOpts);
     if(node.type === 'llm') return runLLMNode(node.id, runOpts);
-    if(node.type === 'video') return runVideoNode(node.id, runOpts);
+    // 视频节点可选「云端 API」或「ComfyUI 工作流」两种来源
+    if(node.type === 'video'){
+        if(node.videoSource === 'comfy'){
+            node.mode = 'custom';
+            return runComfyNode(node.id, runOpts);
+        }
+        return runVideoNode(node.id, runOpts);
+    }
     if(node.type === 'rh') return runRhNode(node.id, runOpts);
     if(node.type === 'minimax') return runMiniMaxNode(node.id, runOpts);
     return Promise.resolve();
@@ -13317,10 +13646,11 @@ function runSnapshot(node, prompt, refs=[]){
     delete clone.runError;
     delete clone.inputs;
     return {
+        nodeId: node?.id || '',
         nodeType: node?.type || '',
         node: clone,
         prompt: prompt || '',
-        refs: (refs || []).map(ref => ({url:ref.url, name:ref.name || 'image'})).filter(ref => ref.url),
+        refs: (refs || []).map(ref => ({url:ref.url, name:ref.name || 'image', kind:mediaKindForRef(ref)})).filter(ref => ref.url),
     };
 }
 function comfyRunLabel(node){
@@ -13377,30 +13707,220 @@ function logTaskLabel(log){
     }
     return log?.model || '-';
 }
+// 生成结果自动归档到资产库：按 图片/视频/音频 三类，分类不存在时自动创建
+const archivedAssetUrls = new Set();
+const autoAssetCategoryState = { libraryId:'', ids:{} };
+const AUTO_ASSET_CATEGORY_NAMES = { image:'生成图片', video:'生成视频', audio:'生成音频' };
+
+function isLocalAssetLibraryUrl(url){
+    const value = String(url || '');
+    return value.startsWith('/assets/') || value.startsWith('/output/');
+}
+function autoAssetItemName(url){
+    const base = String(url || '').split('/').pop() || '';
+    const dot = base.lastIndexOf('.');
+    return (dot > 0 ? base.slice(0, dot) : base) || 'generated';
+}
+async function loadAutoAssetLibraryState(){
+    if(autoAssetCategoryState.libraryId) return autoAssetCategoryState;
+    const res = await fetch('/api/asset-library');
+    if(!res.ok) throw new Error('资产库不可用');
+    const data = await res.json();
+    const lib = data?.library || data;
+    const activeId = lib?.active_library_id || '';
+    const active = (lib?.libraries || []).find(l => l.id === activeId) || (lib?.libraries || [])[0];
+    if(!active) throw new Error('资产库不可用');
+    autoAssetCategoryState.libraryId = active.id;
+    autoAssetCategoryState.ids = {};
+    for(const kind of Object.keys(AUTO_ASSET_CATEGORY_NAMES)){
+        const hit = (active.categories || []).find(c => c.type === 'image' && c.name === AUTO_ASSET_CATEGORY_NAMES[kind]);
+        if(hit) autoAssetCategoryState.ids[kind] = hit.id;
+    }
+    return autoAssetCategoryState;
+}
+async function ensureAutoAssetCategory(kind){
+    const state = await loadAutoAssetLibraryState();
+    if(state.ids[kind]) return state.ids[kind];
+    const name = AUTO_ASSET_CATEGORY_NAMES[kind];
+    const res = await fetch('/api/asset-library/categories', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ library_id:state.libraryId, name, type:'image' })
+    });
+    if(!res.ok) throw new Error('创建资产分类失败');
+    const data = await res.json();
+    const categoryId = data?.category?.id || '';
+    if(!categoryId) throw new Error('创建资产分类失败');
+    state.ids[kind] = categoryId;
+    return categoryId;
+}
+async function autoArchiveGenerationOutputs(outputs){
+    const state = await loadAutoAssetLibraryState();
+    const pending = (outputs || []).map(item => {
+        const url = outputUrlValue(item);
+        const kind = mediaKindForOutputItem(item);
+        if(!url || !AUTO_ASSET_CATEGORY_NAMES[kind]) return null;
+        if(!isLocalAssetLibraryUrl(url) || archivedAssetUrls.has(url)) return null;
+        return { url, kind, name:autoAssetItemName(url) };
+    }).filter(Boolean);
+    if(!pending.length) return;
+    let saved = 0;
+    for(const kind of Object.keys(AUTO_ASSET_CATEGORY_NAMES)){
+        const group = pending.filter(entry => entry.kind === kind);
+        if(!group.length) continue;
+        const categoryId = await ensureAutoAssetCategory(kind);
+        const res = await fetch('/api/asset-library/items/batch', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                library_id:state.libraryId,
+                category_id:categoryId,
+                items:group.map(entry => ({ url:entry.url, name:entry.name }))
+            })
+        });
+        if(!res.ok) continue;
+        group.forEach(entry => archivedAssetUrls.add(entry.url));
+        saved += group.length;
+    }
+    if(saved && canvasAssetLibraryOpen) loadCanvasAssetLibrary({ renderPanel:true }).catch(() => {});
+}
+const CANVAS_LOG_MAX = 500;
+// 只有最近的日志保留完整提交信息（提交参数 + 节点快照），更早的日志只留概览，避免画布数据过大
+const CANVAS_LOG_DETAIL_MAX = 60;
+function logSubmitPayload(run){
+    const submit = run?.submit;
+    if(!submit || typeof submit !== 'object') return null;
+    const copy = JSON.parse(JSON.stringify(submit));
+    // prompt 与日志里的 prompt 字段相同，省略一份以控制体积，重放时再补回
+    if(copy.prompt === (run?.prompt || '')) delete copy.prompt;
+    return copy;
+}
+function logNodeSnapshot(node){
+    if(!node || typeof node !== 'object') return null;
+    const clone = JSON.parse(JSON.stringify(node));
+    ['inputs','running','runStatus','runError','generatedOutputs','imageComparisons','tempShLinks','_pending'].forEach(key => delete clone[key]);
+    Object.keys(clone).forEach(key => { if(key.startsWith('_')) delete clone[key]; });
+    return clone;
+}
+function stripCanvasLogDetail(log){
+    if(!log) return log;
+    delete log.submit;
+    delete log.response;
+    delete log.node;
+    return log;
+}
 function addGenerationLog({run, outputs=[], runMs=0, error=''}) {
     if(!canvas) return;
     canvas.logs = canvas.logs || [];
     if(!error && (outputs || []).some(item => outputUrlValue(item))) playGenerationCompleteSound();
+    // 生成成功后自动归档到资产库（图片/视频/音频分类），失败不影响主流程
+    if(!error && (outputs || []).some(item => outputUrlValue(item))) autoArchiveGenerationOutputs(outputs).catch(() => {});
     const entry = {
         id:uid('log'),
         createdAt:Date.now(),
         status:error ? 'failed' : 'success',
         platform:runPlatformLabel(run),
         nodeType:run?.nodeType || '',
+        nodeId:run?.nodeId || run?.node?.id || '',
         model:run?.taskLabel || runTaskLabel(run),
         request:run?.request || {},
+        submit:logSubmitPayload(run),
+        response:run?.response || null,
+        node:logNodeSnapshot(run?.node),
         prompt:run?.prompt || '',
         outputs:(outputs || []).filter(Boolean),
         refs:run?.refs || [],
         runMs:Number(runMs || 0),
         error:error ? String(error) : '',
     };
-    canvas.logs = [entry, ...canvas.logs].slice(0, 500);
+    canvas.logs = [entry, ...canvas.logs].slice(0, CANVAS_LOG_MAX);
+    canvas.logs.forEach((log, index) => { if(index >= CANVAS_LOG_DETAIL_MAX) stripCanvasLogDetail(log); });
+}
+// 日志详情里的可复制文本先登记到内存，用 key 引用，避免把大段 JSON 塞进 DOM 属性
+let canvasLogCopyStore = {};
+function registerCanvasLogCopy(text){
+    const key = `c${Object.keys(canvasLogCopyStore).length}`;
+    canvasLogCopyStore[key] = String(text ?? '');
+    return key;
+}
+function canvasLogFieldHtml(label, value){
+    if(value === undefined || value === null || value === '') return '';
+    const text = String(value);
+    return `<div class="log-field" data-copy-key="${registerCanvasLogCopy(text)}" title="${escapeAttr(text)}">
+        <div class="log-field-label">${escapeHtml(label)}</div>
+        <div class="log-field-value">${escapeHtml(text)}</div>
+    </div>`;
+}
+function canvasLogBlockHtml(label, text){
+    if(!text) return '';
+    return `<div class="log-block">
+        <div class="log-block-head"><span>${escapeHtml(label)}</span><button class="log-btn tiny" type="button" data-copy-key="${registerCanvasLogCopy(text)}" data-copy-label="${escapeAttr(tr('canvas.copy'))}">${escapeHtml(tr('canvas.copy'))}</button></div>
+        <pre class="log-pre">${escapeHtml(text)}</pre>
+    </div>`;
+}
+// 日志详情：展示提交给 ComfyUI 后端的完整信息（请求参数、返回元信息、节点配置、提示词等）
+function canvasLogDetailHtml(log){
+    const req = log.request || {};
+    const res = log.response || {};
+    const seed = (req.seed === undefined || req.seed === '') ? res.seed : req.seed;
+    const fields = [
+        canvasLogFieldHtml(tr('canvas.logNode'), [log.nodeType || '-', log.nodeId].filter(Boolean).join(' · ')),
+        canvasLogFieldHtml(tr('canvas.logTime'), new Date(log.createdAt || Date.now()).toLocaleString(langIsEn() ? 'en-US' : 'zh-CN')),
+        canvasLogFieldHtml(tr('canvas.logDuration'), formatRunDuration(log.runMs || 0)),
+        canvasLogFieldHtml(tr('canvas.logTaskId'), req.task_id || res.task_id || ''),
+        canvasLogFieldHtml(tr('canvas.logPromptId'), req.prompt_id || res.prompt_id || ''),
+        canvasLogFieldHtml(tr('canvas.logRequestId'), req.request_id || ''),
+        canvasLogFieldHtml(tr('canvas.logBackend'), req.backend || res.backend || ''),
+        canvasLogFieldHtml(tr('canvas.logSeed'), seed === undefined || seed === null ? '' : seed),
+        canvasLogFieldHtml(tr('canvas.logWorkflow'), req.workflow_json || ''),
+    ].join('');
+    const items = Array.isArray(res.items) ? res.items : [];
+    const outputLines = items.length
+        ? items.map(item => `${item.node_id !== '' && item.node_id !== undefined ? `#${item.node_id} ` : ''}${item.class_type || ''} → ${item.output_key || ''} · ${item.url || ''}`.trim())
+        : (log.outputs || []).map(outputUrlValue).filter(Boolean);
+    const refLines = (log.refs || []).map(ref => `${ref.kind || mediaKindForRef(ref)} · ${ref.name || ''} · ${ref.url || ''}`.trim());
+    const submit = log.submit && typeof log.submit === 'object' ? log.submit : null;
+    let submitBody = '';
+    if(submit){
+        const body = JSON.parse(JSON.stringify(submit));
+        delete body.params;
+        if(Object.keys(body).length) submitBody = JSON.stringify(body, null, 2);
+    }
+    const blocks = [
+        canvasLogBlockHtml(tr('canvas.logOutputsMeta'), outputLines.join('\n')),
+        canvasLogBlockHtml(tr('canvas.logRefs'), refLines.join('\n')),
+        canvasLogBlockHtml(tr('canvas.logParams'), submit?.params ? JSON.stringify(submit.params, null, 2) : ''),
+        canvasLogBlockHtml(tr('canvas.logPayload'), submitBody),
+        canvasLogBlockHtml(tr('canvas.logNodeConfig'), log.node ? JSON.stringify(log.node, null, 2) : ''),
+        canvasLogBlockHtml(tr('canvas.logPromptFull'), log.prompt || ''),
+        canvasLogBlockHtml(tr('canvas.logError'), log.error || ''),
+    ].join('');
+    if(!fields && !blocks) return '';
+    return `${fields ? `<div class="log-detail-grid">${fields}</div>` : ''}${blocks}`;
+}
+function bindCanvasLogCopyButtons(scope){
+    (scope || document).querySelectorAll('[data-copy-key]').forEach(el => {
+        el.onclick = async e => {
+            e.stopPropagation();
+            const copied = await copyTextToClipboard(canvasLogCopyStore[el.dataset.copyKey] || '');
+            if(!copied) return;
+            if(el.classList.contains('log-btn')){
+                const label = el.dataset.copyLabel || el.textContent;
+                el.textContent = tr('canvas.copied');
+                el.classList.add('copied');
+                setTimeout(() => { el.textContent = label; el.classList.remove('copied'); }, 900);
+                return;
+            }
+            el.classList.add('copied');
+            setTimeout(() => el.classList.remove('copied'), 900);
+        };
+    });
 }
 function renderCanvasLog(){
     const list = document.getElementById('logList') || (typeof logList !== 'undefined' ? logList : null);
     const logs = (typeof canvas !== 'undefined' && Array.isArray(canvas?.logs)) ? canvas.logs : [];
     if(!list) return;
+    canvasLogCopyStore = {};
     list.innerHTML = logs.length ? logs.map(log => {
         const thumbs = (log.outputs || []).slice(0, 8).map(item => {
             const url = outputUrlValue(item);
@@ -13425,6 +13945,7 @@ function renderCanvasLog(){
             idText ? `ID ${idText}` : '',
             backendText,
         ].filter(Boolean);
+        const canReplay = Boolean(log.submit) || Boolean(log.nodeId);
         return `<div class="log-item ${log.status === 'failed' ? 'failed' : ''}">
             <div class="log-main">
                 <div class="log-meta">
@@ -13432,10 +13953,16 @@ function renderCanvasLog(){
                     <span class="log-chip">${escapeHtml(log.platform || '-')}</span>
                     ${taskLabel ? `<span class="log-chip">${escapeHtml(taskLabel)}</span>` : ''}
                     <span class="log-chip">${escapeHtml(formatRunDuration(log.runMs || 0))}</span>
+                    ${log.submit ? `<span class="log-chip">${escapeHtml(tr('canvas.logReplayable'))}</span>` : ''}
                 </div>
                 <div class="log-subline">${subParts.map(part => `<span title="${escapeAttr(part)}">${escapeHtml(part)}</span>`).join('')}</div>
                 ${log.error ? `<div class="log-error" title="${escapeAttr(log.error)}" data-error="${escapeAttr(log.error)}">${escapeHtml(log.error)}</div>` : ''}
                 <div class="log-prompt" title="${escapeAttr(log.prompt || tr('canvas.noPromptMeta'))}" data-prompt="${escapeAttr(log.prompt || '')}">${escapeHtml(log.prompt || tr('canvas.noPromptMeta'))}</div>
+                <div class="log-bar">
+                    ${canReplay ? `<button class="log-btn primary" type="button" data-replay="${escapeAttr(log.id)}"><i data-lucide="refresh-cw" class="w-3 h-3"></i>${escapeHtml(tr('canvas.logReplay'))}</button>` : ''}
+                    <button class="log-btn" type="button" data-log-toggle="${escapeAttr(log.id)}">${escapeHtml(tr('canvas.logDetail'))}</button>
+                </div>
+                <div class="log-detail" data-log-detail="${escapeAttr(log.id)}" hidden></div>
             </div>
             <div class="log-thumbs">${thumbs}</div>
         </div>`;
@@ -13465,8 +13992,103 @@ function renderCanvasLog(){
     };
     bindCanvasLogCopy('[data-prompt]', 'prompt');
     bindCanvasLogCopy('[data-error]', 'error');
+    // 详情按需渲染：展开时才序列化提交参数与节点配置，避免一次渲染全部日志的开销
+    list.querySelectorAll('[data-log-toggle]').forEach(btn => {
+        btn.onclick = e => {
+            e.stopPropagation();
+            const panel = btn.closest('.log-main')?.querySelector('[data-log-detail]');
+            if(!panel) return;
+            if(panel.hidden && !panel.innerHTML){
+                const log = (canvas?.logs || []).find(item => item.id === btn.dataset.logToggle);
+                if(log) panel.innerHTML = canvasLogDetailHtml(log);
+                bindCanvasLogCopyButtons(panel);
+            }
+            panel.hidden = !panel.hidden;
+            btn.classList.toggle('active', !panel.hidden);
+        };
+    });
+    list.querySelectorAll('[data-replay]').forEach(btn => {
+        btn.onclick = e => {
+            e.stopPropagation();
+            regenerateFromLog(btn.dataset.replay);
+        };
+    });
     refreshIcons();
 }
+// 按日志里的节点快照恢复画布节点的工作流配置（工作流、模式、参数等）
+function canvasLogRestoreNode(node, log){
+    const snapshot = log?.node && typeof log.node === 'object' ? log.node : null;
+    if(snapshot){
+        Object.entries(snapshot).forEach(([key, value]) => {
+            if(['id','x','y','w','h','inputs','generatedOutputs','running','runStatus','runError'].includes(key)) return;
+            node[key] = JSON.parse(JSON.stringify(value));
+        });
+    }
+    // 快照里的工作流文件可能已被改名/删除，优先使用日志里提交时用的工作流
+    const loggedWorkflow = log?.request?.workflow_json || '';
+    if(loggedWorkflow && hasComfyWorkflow(loggedWorkflow)) node.comfyWorkflow = loggedWorkflow;
+    else if(node.comfyWorkflow && !hasComfyWorkflow(node.comfyWorkflow)) node.comfyWorkflow = validComfyWorkflowName(node.comfyWorkflow);
+}
+// 按日志里的提示词与参考素材补齐输入节点和连线，把日志恢复成可运行的画布工作流
+function canvasLogRestoreInputs(node, log){
+    const incoming = connections.filter(c => c.to === node.id)
+        .map(c => nodes.find(n => n.id === c.from))
+        .filter(Boolean);
+    if(!incoming.some(n => ['prompt','promptGroup','llm','loop'].includes(n.type)) && (log.prompt || '').trim()){
+        const promptNode = addNode({id:uid('prompt'), type:'prompt', x:node.x, y:node.y - 170, text:log.prompt});
+        if(promptNode) connections.push({id:uid('c'), from:promptNode.id, to:node.id});
+    }
+    if(!incoming.some(n => n.type === 'image' || n.type === 'group')){
+        (log.refs || []).forEach((ref, index) => {
+            if(!ref?.url) return;
+            const kind = ref.kind || mediaKindForRef(ref);
+            const media = addNode({
+                id:uid('img'),
+                type:'image',
+                x:node.x - 260,
+                y:node.y + index * 150,
+                url:ref.url,
+                name:ref.name || kind,
+                mediaKind:kind === 'image' ? '' : kind,
+            });
+            if(media && canConnect(media.id, node.id)) connections.push({id:uid('c'), from:media.id, to:node.id});
+        });
+    }
+    syncGeneratorInputs();
+}
+// 根据日志里记录的提交信息与节点快照，在画布上重建这条工作流并重新生成
+async function regenerateFromLog(logId){
+    const log = (canvas?.logs || []).find(item => item.id === logId);
+    if(!log) return;
+    const hasDetail = Boolean(log.node) || Boolean(log.submit);
+    let node = log.nodeId ? nodes.find(n => n.id === log.nodeId) || null : null;
+    if(node?.running){ alert(langIsEn() ? 'This node is running.' : '当前节点正在运行'); return; }
+    if(!hasDetail){
+        // 旧日志没有记录工作流明细，只能按原节点当前配置重跑
+        if(node){ closeCanvasLog(); runNodeCascade(node.id); return; }
+        alert(tr('canvas.logReplayNoData'));
+        return;
+    }
+    if(!node){
+        // 原节点已被删除：按日志里的节点类型重建一个画布节点
+        const restoreType = canvasRunTypes().includes(log.nodeType) ? log.nodeType : 'comfy';
+        node = createNodeByType(restoreType, defaultPoint(0, 0));
+        if(!node){ alert(tr('canvas.logReplayNoData')); return; }
+    }
+    // 1) 用日志快照恢复节点的工作流配置
+    canvasLogRestoreNode(node, log);
+    // 2) 用日志里的提示词/参考素材补齐输入节点与连线，恢复成完整的画布工作流
+    canvasLogRestoreInputs(node, log);
+    closeCanvasLog();
+    render();
+    scheduleSave();
+    if(!canvasRunTypes().includes(node.type)){ alert(tr('canvas.logReplayNoData')); return; }
+    // 3) 走画布工作流重新生成
+    setStatus(tr('canvas.logReplaying'));
+    await runNodeCascade(node.id);
+    setStatus(tr('canvas.logReplayed'));
+}
+window.regenerateFromLog = regenerateFromLog;
 async function importWorkflowAssetUrl(url, name='workflow'){
     if(!canvas || !url) return;
     try {
@@ -13512,7 +14134,7 @@ function makePendingForRun(id, run, node, options={}, task={}){
 }
 function mergeGeneratedOutputs(node, outputs, append=false){
     if(!node) return;
-    const keepGeneratedMedia = ['rh','ltxDirector','video','minimax'].includes(node.type);
+    const keepGeneratedMedia = ['rh','ltxDirector','video','minimax','comfy'].includes(node.type);
     const clean = (outputs || []).map(item => {
         const url = outputUrlValue(item);
         if(!url) return null;
@@ -13596,6 +14218,34 @@ async function waitCanvasComfyTaskResult(taskId, options={}){
 async function runQueuedComfyGenerate(payload, options={}){
     const task = await createCanvasComfyTask(payload, options);
     return waitCanvasComfyTaskResult(task.task_id, options);
+}
+// 从 ComfyUI 返回结果里提取提交到后台后的关键信息，供生成日志展示
+function comfyResponseMeta(result={}){
+    const items = Array.isArray(result.items) ? result.items : [];
+    return {
+        type: result.type || '',
+        task_id: result.task_id || '',
+        prompt_id: result.prompt_id || '',
+        backend: result.backend || '',
+        seed: result.seed ?? '',
+        timestamp: result.timestamp || '',
+        items: items.map(item => ({
+            url: item.url || '',
+            kind: item.kind || '',
+            name: item.name || '',
+            node_id: item.node_id ?? '',
+            output_key: item.output_key || '',
+            class_type: item.class_type || '',
+        })),
+    };
+}
+// 提交 ComfyUI 任务时把完整请求参数与返回元信息记录到 run 上，日志里可以查看并复现
+async function submitComfyTask(run, payload, options={}){
+    run.submit = JSON.parse(JSON.stringify(payload || {}));
+    const result = await runQueuedComfyGenerate(payload, options);
+    run.request = requestMetaFromResult(result);
+    run.response = comfyResponseMeta(result);
+    return result;
 }
 function extractUpstreamTaskId(text){
     const match = String(text || '').match(/(?:task_id|taskId|task id)\s*[=:：]\s*([A-Za-z0-9_.:-]+)/i);

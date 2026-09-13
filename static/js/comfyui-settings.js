@@ -150,6 +150,8 @@ function escapeHtml(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, c=
 function escapeAttr(s){ return escapeHtml(s); }
 function fieldKind(f){
     if(['image','video','audio'].includes(f.type)) return f.type;
+    if(f.bind_prompt === true) return 'prompt';
+    if(f.bind_prompt === false) return 'setting';
     const key = `${f.input || ''} ${f.name || ''}`.toLowerCase();
     if(f.type === 'textarea' || /prompt|text|提示词|正向|负向/.test(key)) return 'prompt';
     return 'setting';
@@ -408,7 +410,8 @@ function updateField(fieldId, key, value){
     }
     // 文本/数字输入过程中不能重建浮窗，否则输入框会失焦，表现成每次只能输入 1 个字。
     // 这些字段只影响预览或运行参数，直接同步数据即可；切换 type 才需要重建表单结构。
-    if(key === 'name' || key === 'min' || key === 'max' || key === 'step' || key === 'default' || key === 'options' || key === 'random_enabled'){
+    if(key === 'name' || key === 'min' || key === 'max' || key === 'step' || key === 'default' || key === 'options' || key === 'random_enabled'
+        || key === 'bind_prompt' || key === 'multi' || key === 'max_items' || key === 'prefix'){
         renderPreview();
         if(workspaceMode === 'canvas') renderMiniCanvasPreview(miniCanvasHost, true);
         return;
@@ -485,8 +488,34 @@ function renderEditor(){
                 </div>
             </div>
         `;
-    }).join('');
+    }).join('') + renderExtraMappingsCard();
     refreshIcons();
+}
+
+function renderExtraMappingsCard(){
+    const visibleKeys = new Set();
+    Object.entries(currentWorkflow || {}).forEach(([nodeId, node]) => {
+        Object.keys(node?.inputs || {}).forEach(k => visibleKeys.add(`${nodeId}\u0000${k}`));
+    });
+    const extraFields = (currentConfig.fields || []).filter(f => f.node && f.input && !visibleKeys.has(`${f.node}\u0000${f.input}`));
+    if(!extraFields.length) return '';
+    const title = currentLang() === 'en' ? 'Extra mappings' : '扩展映射';
+    const hint = currentLang() === 'en'
+        ? 'Injected at run time (dynamic multi-inputs are not stored in the workflow JSON)'
+        : '运行时自动注入（动态多输入不会写进工作流 JSON）';
+    return `
+        <div class="node-card expanded">
+            <div class="node-card-head" style="cursor:default">
+                <div style="display:flex;align-items:center;gap:12px;min-width:0;flex:1">
+                    <span style="font-size:20px;line-height:1;flex:0 0 auto">🔗</span>
+                    <div style="min-width:0">
+                        <div class="node-class">${title}</div>
+                        <div class="node-id">${hint}</div>
+                    </div>
+                </div>
+            </div>
+            <div class="node-inputs">${extraFields.map(renderExtraFieldRow).join('')}</div>
+        </div>`;
 }
 
 // 计算节点拓扑层级（按从入度 0 的源节点向下游传播）
@@ -828,7 +857,48 @@ function renderExtras(f){
             <button class="ghost-btn" type="button" onclick="event.stopPropagation();addDropdownOption('${fid}')" style="height:34px;padding:0 16px;font-size:12px;font-weight:800;align-self:flex-start;gap:6px"><i data-lucide="plus" class="w-3.5 h-3.5"></i><span>添加选项</span></button>
         </div>`;
     }
+    if(['image','video','audio'].includes(f.type)){
+        const maxPlaceholder = f.type === 'image' ? '9' : '3';
+        return `<div class="extras-row">
+            <label class="random-toggle" onclick="event.stopPropagation()"><input type="checkbox" ${f.multi === true ? 'checked' : ''} onchange="updateField('${f.id}','multi',this.checked)">多值(动态多输入)</label>
+            <div class="extra-pair">上限<input class="small-input" type="number" value="${f.max_items ?? ''}" placeholder="${maxPlaceholder}" oninput="updateField('${f.id}','max_items',this.value===''?null:parseInt(this.value,10))"></div>
+            <div class="extra-pair">键前缀<input class="small-input" type="text" value="${escapeAttr(f.prefix || '')}" placeholder="ref_image_" oninput="updateField('${f.id}','prefix',this.value)"></div>
+        </div>`;
+    }
+    if(f.type === 'text' || f.type === 'textarea'){
+        const cur = f.bind_prompt === true ? 'true' : f.bind_prompt === false ? 'false' : '';
+        return `<div class="extras-row">
+            <div class="extra-pair">提示词绑定<select class="small-select" onchange="updateField('${f.id}','bind_prompt',this.value===''?null:this.value==='true')"><option value="" ${cur===''?'selected':''}>自动</option><option value="true" ${cur==='true'?'selected':''}>是</option><option value="false" ${cur==='false'?'selected':''}>否</option></select></div>
+        </div>`;
+    }
     return '';
+}
+// 工作流 JSON 里没有显式出现的映射（例如 ComfyUI 动态多输入 ref_images / ref_audios，
+// 空值时不会写进 API 工作流），单独列出来，避免这些映射在界面上"隐形"。
+function renderExtraFieldRow(f){
+    const kindHint = f.multi
+        ? `${currentLang() === 'en' ? 'multi (autogrow)' : '多值(动态多输入)'} · ${currentLang() === 'en' ? 'max' : '上限'} ${f.max_items ?? ''} · ${escapeHtml(f.prefix || '')}`
+        : (currentLang() === 'en' ? 'injected at run time' : '运行时注入');
+    return `
+        <div class="input-row is-active has-extras">
+            <div class="check-toggle checked" onclick="removeExtraField('${escapeAttr(f.id)}')" title="${escapeAttr(tr('common.delete'))}"><i data-lucide="check" class="w-3 h-3"></i></div>
+            <div class="input-info">
+                <div class="input-key">${escapeHtml(f.name || f.input)} <span style="font-size:10px;font-weight:600;color:var(--faint);margin-left:4px">#${escapeHtml(f.node)} · ${escapeHtml(f.input)}</span></div>
+                <div class="input-orig">${kindHint}</div>
+            </div>
+            <input class="small-input" type="text" value="${escapeAttr(f.name || '')}" oninput="updateField('${escapeAttr(f.id)}','name',this.value)">
+            <select class="small-select" onchange="updateField('${escapeAttr(f.id)}','type',this.value)">
+                ${TYPES.map(t=>`<option value="${t.v}" ${f.type===t.v?'selected':''}>${typeLabel(t.v)}</option>`).join('')}
+            </select>
+            ${renderExtras(f)}
+        </div>`;
+}
+function removeExtraField(fieldId){
+    currentConfig.fields = currentConfig.fields.filter(f => f.id !== fieldId);
+    delete previewValues[fieldId];
+    delete previewRandomActive[fieldId];
+    renderEditor();
+    renderPreview();
 }
 function updateDropdownOption(fieldId, index, value, inputEl){
     const f = currentConfig.fields.find(x => x.id === fieldId); if(!f) return;

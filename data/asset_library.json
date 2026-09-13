@@ -24,7 +24,134 @@
           "id": "workflows",
           "name": "工作流",
           "type": "workflow",
-          "items": []
+          "items": [
+            {
+              "id": "wf_3f310e467135",
+              "name": "H3参考生视频",
+              "url": "/assets/library/workflow_0af1b063e952_H3参考生视频.json",
+              "kind": "workflow",
+              "type": "workflow",
+              "format": "json",
+              "size": 9902,
+              "created_at": 1789208210128,
+              "registrations": {}
+            },
+            {
+              "id": "wf_3e7666346491",
+              "name": "FLUX基础文生图工作流",
+              "url": "/assets/library/workflow_7497235f6098_FLUX基础文生图工作流.json",
+              "kind": "workflow",
+              "type": "workflow",
+              "format": "json",
+              "size": 3074,
+              "created_at": 1789180669403,
+              "registrations": {}
+            }
+          ]
+        },
+        {
+          "id": "cat_08c2fda527c1",
+          "name": "生成视频",
+          "type": "image",
+          "items": [
+            {
+              "id": "asset_c953566cea7b",
+              "name": "workflow-custom_1789271437_a1e1cde29d",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_c0bc653bd9e8_workflow-custom_1789271437_a1e1cde29d.mp4",
+              "kind": "video",
+              "created_at": 1789271448858,
+              "registrations": {}
+            },
+            {
+              "id": "asset_402e6851bd48",
+              "name": "workflow-custom_1789269268_f637196923",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_75f2c697cf42_workflow-custom_1789269268_f637196923.mp4",
+              "kind": "video",
+              "created_at": 1789269279502,
+              "registrations": {}
+            },
+            {
+              "id": "asset_689448156542",
+              "name": "workflow-custom_1789226179_6a170f0df5",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_cf29cfea49e1_workflow-custom_1789226179_6a170f0df5.mp4",
+              "kind": "video",
+              "created_at": 1789226185812,
+              "registrations": {}
+            },
+            {
+              "id": "asset_701b3fcb41bd",
+              "name": "workflow-custom_1789225363_3c19b70703",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_d6248c93b4a6_workflow-custom_1789225363_3c19b70703.mp4",
+              "kind": "video",
+              "created_at": 1789225371818,
+              "registrations": {}
+            },
+            {
+              "id": "asset_9c0c0e968847",
+              "name": "workflow-custom_1789222670_cfe639d051",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_356c1210bc2e_workflow-custom_1789222670_cfe639d051.mp4",
+              "kind": "video",
+              "created_at": 1789222676794,
+              "registrations": {}
+            },
+            {
+              "id": "asset_d2dde74ec98d",
+              "name": "workflow-custom_1789219459_1a7b7932b3",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_49032e10aa9b_workflow-custom_1789219459_1a7b7932b3.mp4",
+              "kind": "video",
+              "created_at": 1789219465259,
+              "registrations": {}
+            },
+            {
+              "id": "asset_ae705613976f",
+              "name": "workflow-custom_1789218264_b7fa132597",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_a7a76eae87aa_workflow-custom_1789218264_b7fa132597.mp4",
+              "kind": "video",
+              "created_at": 1789218275289,
+              "registrations": {}
+            },
+            {
+              "id": "asset_7325d7d5fbe4",
+              "name": "workflow-custom_1789217818_c7ea1c6423",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_4bebe0130087_workflow-custom_1789217818_c7ea1c6423.mp4",
+              "kind": "video",
+              "created_at": 1789217823871,
+              "registrations": {}
+            },
+            {
+              "id": "asset_27a8929076ae",
+              "name": "workflow-custom_1789215667_014f98f301",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_9ee254d03981_workflow-custom_1789215667_014f98f301.mp4",
+              "kind": "video",
+              "created_at": 1789216287203,
+              "registrations": {}
+            }
+          ],
+          "dir": "生成视频"
+        },
+        {
+          "id": "cat_ebe3e00310c1",
+          "name": "生成图片",
+          "type": "image",
+          "items": [
+            {
+              "id": "asset_a88decb2e670",
+              "name": "workflow-custom_1789222108_8fb505eac6",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E5%9B%BE%E7%89%87/lib_7fffa5d9e133_workflow-custom_1789222108_8fb505eac6.png",
+              "kind": "image",
+              "created_at": 1789222114909,
+              "registrations": {}
+            },
+            {
+              "id": "asset_51e0f50ace52",
+              "name": "workflow-custom_1789221959_fe2769c500",
+              "url": "/assets/library/%E7%94%9F%E6%88%90%E5%9B%BE%E7%89%87/lib_d998b0f61df5_workflow-custom_1789221959_fe2769c500.png",
+              "kind": "image",
+              "created_at": 1789221965857,
+              "registrations": {}
+            }
+          ],
+          "dir": "生成图片"
         }
       ]
     }
@@ -48,8 +175,135 @@
       "id": "workflows",
       "name": "工作流",
       "type": "workflow",
-      "items": []
+      "items": [
+        {
+          "id": "wf_3f310e467135",
+          "name": "H3参考生视频",
+          "url": "/assets/library/workflow_0af1b063e952_H3参考生视频.json",
+          "kind": "workflow",
+          "type": "workflow",
+          "format": "json",
+          "size": 9902,
+          "created_at": 1789208210128,
+          "registrations": {}
+        },
+        {
+          "id": "wf_3e7666346491",
+          "name": "FLUX基础文生图工作流",
+          "url": "/assets/library/workflow_7497235f6098_FLUX基础文生图工作流.json",
+          "kind": "workflow",
+          "type": "workflow",
+          "format": "json",
+          "size": 3074,
+          "created_at": 1789180669403,
+          "registrations": {}
+        }
+      ]
+    },
+    {
+      "id": "cat_08c2fda527c1",
+      "name": "生成视频",
+      "type": "image",
+      "items": [
+        {
+          "id": "asset_c953566cea7b",
+          "name": "workflow-custom_1789271437_a1e1cde29d",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_c0bc653bd9e8_workflow-custom_1789271437_a1e1cde29d.mp4",
+          "kind": "video",
+          "created_at": 1789271448858,
+          "registrations": {}
+        },
+        {
+          "id": "asset_402e6851bd48",
+          "name": "workflow-custom_1789269268_f637196923",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_75f2c697cf42_workflow-custom_1789269268_f637196923.mp4",
+          "kind": "video",
+          "created_at": 1789269279502,
+          "registrations": {}
+        },
+        {
+          "id": "asset_689448156542",
+          "name": "workflow-custom_1789226179_6a170f0df5",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_cf29cfea49e1_workflow-custom_1789226179_6a170f0df5.mp4",
+          "kind": "video",
+          "created_at": 1789226185812,
+          "registrations": {}
+        },
+        {
+          "id": "asset_701b3fcb41bd",
+          "name": "workflow-custom_1789225363_3c19b70703",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_d6248c93b4a6_workflow-custom_1789225363_3c19b70703.mp4",
+          "kind": "video",
+          "created_at": 1789225371818,
+          "registrations": {}
+        },
+        {
+          "id": "asset_9c0c0e968847",
+          "name": "workflow-custom_1789222670_cfe639d051",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_356c1210bc2e_workflow-custom_1789222670_cfe639d051.mp4",
+          "kind": "video",
+          "created_at": 1789222676794,
+          "registrations": {}
+        },
+        {
+          "id": "asset_d2dde74ec98d",
+          "name": "workflow-custom_1789219459_1a7b7932b3",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_49032e10aa9b_workflow-custom_1789219459_1a7b7932b3.mp4",
+          "kind": "video",
+          "created_at": 1789219465259,
+          "registrations": {}
+        },
+        {
+          "id": "asset_ae705613976f",
+          "name": "workflow-custom_1789218264_b7fa132597",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_a7a76eae87aa_workflow-custom_1789218264_b7fa132597.mp4",
+          "kind": "video",
+          "created_at": 1789218275289,
+          "registrations": {}
+        },
+        {
+          "id": "asset_7325d7d5fbe4",
+          "name": "workflow-custom_1789217818_c7ea1c6423",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_4bebe0130087_workflow-custom_1789217818_c7ea1c6423.mp4",
+          "kind": "video",
+          "created_at": 1789217823871,
+          "registrations": {}
+        },
+        {
+          "id": "asset_27a8929076ae",
+          "name": "workflow-custom_1789215667_014f98f301",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E8%A7%86%E9%A2%91/lib_9ee254d03981_workflow-custom_1789215667_014f98f301.mp4",
+          "kind": "video",
+          "created_at": 1789216287203,
+          "registrations": {}
+        }
+      ],
+      "dir": "生成视频"
+    },
+    {
+      "id": "cat_ebe3e00310c1",
+      "name": "生成图片",
+      "type": "image",
+      "items": [
+        {
+          "id": "asset_a88decb2e670",
+          "name": "workflow-custom_1789222108_8fb505eac6",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E5%9B%BE%E7%89%87/lib_7fffa5d9e133_workflow-custom_1789222108_8fb505eac6.png",
+          "kind": "image",
+          "created_at": 1789222114909,
+          "registrations": {}
+        },
+        {
+          "id": "asset_51e0f50ace52",
+          "name": "workflow-custom_1789221959_fe2769c500",
+          "url": "/assets/library/%E7%94%9F%E6%88%90%E5%9B%BE%E7%89%87/lib_d998b0f61df5_workflow-custom_1789221959_fe2769c500.png",
+          "kind": "image",
+          "created_at": 1789221965857,
+          "registrations": {}
+        }
+      ],
+      "dir": "生成图片"
     }
   ],
-  "updated_at": 1783212587156
+  "updated_at": 1789271448858
 }

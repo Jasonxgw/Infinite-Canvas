@@ -29,6 +29,7 @@ import html
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional, Tuple
 from threading import Lock, Thread
+from collections import deque
 import httpx
 from PIL import Image, ImageOps
 from io import BytesIO
@@ -66,6 +67,91 @@ class QuietAccessLogFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(QuietAccessLogFilter())
 
+# --- 运行日志：把后端运行时的终端输出留一份在内存里，供前端「运行日志」面板实时展示 ---
+RUNTIME_LOG_LIMIT = 3000
+RUNTIME_LOG_BUFFER = deque(maxlen=RUNTIME_LOG_LIMIT)
+RUNTIME_LOG_LOCK = Lock()
+RUNTIME_LOG_SEQ = [0]
+# 前端拉日志本身产生的访问日志不入库，避免刷屏
+RUNTIME_LOG_SKIP_PARTS = ("/api/logs",)
+
+def runtime_log_level(text: str) -> str:
+    lowered = text.lower()
+    if "traceback" in lowered or "error" in lowered or "失败" in text or "异常" in text:
+        return "error"
+    if "warn" in lowered or "警告" in text or "超时" in text:
+        return "warn"
+    return "info"
+
+def runtime_log_append(text):
+    line = str(text).replace("\r", "").strip("\n")
+    if not line.strip():
+        return
+    if any(part in line for part in RUNTIME_LOG_SKIP_PARTS):
+        return
+    with RUNTIME_LOG_LOCK:
+        RUNTIME_LOG_SEQ[0] += 1
+        RUNTIME_LOG_BUFFER.append({
+            "id": RUNTIME_LOG_SEQ[0],
+            "ts": int(time.time() * 1000),
+            "level": runtime_log_level(line),
+            "text": line,
+        })
+
+class RuntimeLogStream:
+    """包装 stdout/stderr：照常输出到终端，同时按行收集到日志缓冲。"""
+    def __init__(self, stream):
+        self._stream = stream
+        self._pending = ""
+
+    def write(self, text):
+        if text:
+            try:
+                self._stream.write(text)
+            except Exception:
+                pass
+            self._pending += str(text).replace("\r\n", "\n").replace("\r", "\n")
+            while "\n" in self._pending:
+                line, self._pending = self._pending.split("\n", 1)
+                runtime_log_append(line)
+        return len(text or "")
+
+    def flush(self):
+        if self._pending:
+            runtime_log_append(self._pending)
+            self._pending = ""
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+def runtime_log_install():
+    if getattr(sys.stdout, "_runtime_log_stream", False):
+        return
+    for name in ("stdout", "stderr"):
+        wrapper = RuntimeLogStream(getattr(sys, name))
+        wrapper._runtime_log_stream = True
+        setattr(sys, name, wrapper)
+
+def runtime_log_params_summary(params) -> str:
+    """把映射参数(node -> inputs)压成一行摘要，避免 base64 图片之类把日志刷爆。"""
+    if not isinstance(params, dict) or not params:
+        return "-"
+    parts = []
+    for node_id, inputs in params.items():
+        if not isinstance(inputs, dict):
+            continue
+        for key, value in inputs.items():
+            text = str(value).replace("\n", " ")
+            parts.append(f"{node_id}.{key}={text[:45] + '...' if len(text) > 48 else text}")
+    summary = ", ".join(parts)
+    return summary[:600] + ("..." if len(summary) > 600 else "")
+
+runtime_log_install()
+
 app = FastAPI()
 
 app.add_middleware(
@@ -74,6 +160,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/api/logs")
+def get_runtime_logs(after_id: int = 0, limit: int = 800):
+    """运行日志增量拉取：返回 after_id 之后的新日志，last_id 供下次拉取使用。"""
+    with RUNTIME_LOG_LOCK:
+        entries = [dict(item) for item in RUNTIME_LOG_BUFFER if item["id"] > after_id]
+        last_id = RUNTIME_LOG_SEQ[0]
+    if limit > 0 and len(entries) > limit:
+        entries = entries[-limit:]
+    return {"logs": entries, "last_id": last_id}
+
+@app.delete("/api/logs")
+def clear_runtime_logs():
+    with RUNTIME_LOG_LOCK:
+        RUNTIME_LOG_BUFFER.clear()
+    return {"ok": True}
 
 # --- WebSocket 状态管理器 ---
 class ConnectionManager:
@@ -596,6 +698,11 @@ COMFYUI_HISTORY_TIMEOUT = int(float(os.getenv("COMFYUI_HISTORY_TIMEOUT", "1800")
 # 下载 ComfyUI 产物的 socket 超时（秒，作用于连接和每次 read）。没有它时一次网络卡顿会让 urlopen 永久挂起，
 # 导致 generate() 不返回、画布卡片一直转圈拿不到结果。给得足够大以容纳大视频/大图的正常下载。
 COMFYUI_DOWNLOAD_TIMEOUT = float(os.getenv("COMFYUI_DOWNLOAD_TIMEOUT", "120"))
+# 提交渲染时的自动重试：ComfyUI 重启、反代 502/503/504、连接超时这类临时故障都算
+COMFYUI_SUBMIT_ATTEMPTS = int(float(os.getenv("COMFYUI_SUBMIT_ATTEMPTS", "4")))
+COMFYUI_SUBMIT_TIMEOUT = float(os.getenv("COMFYUI_SUBMIT_TIMEOUT", "20"))
+COMFYUI_SUBMIT_RETRY_DELAY = float(os.getenv("COMFYUI_SUBMIT_RETRY_DELAY", "3"))
+COMFYUI_SUBMIT_RETRY_CODES = {408, 425, 429, 500, 502, 503, 504}
 APIMART_IMAGE_TASK_TIMEOUT = float(os.getenv("APIMART_IMAGE_TASK_TIMEOUT", "1800"))
 APIMART_IMAGE_POLL_INTERVAL = float(os.getenv("APIMART_IMAGE_POLL_INTERVAL", "5"))
 APIMART_IMAGE_INITIAL_POLL_DELAY = float(os.getenv("APIMART_IMAGE_INITIAL_POLL_DELAY", "10"))
@@ -3242,6 +3349,8 @@ def comfy_prompt_error_message(status_code: int, error_body: str) -> str:
     try:
         payload = json.loads(fallback)
     except (TypeError, ValueError):
+        if status_code >= 500:
+            return f"ComfyUI 服务异常（HTTP {status_code}）：{fallback[:500] or '服务端错误'}"
         return f"ComfyUI 请求失败（HTTP {status_code}）：{fallback[:500] or '未知错误'}"
 
     parts = []
@@ -3272,7 +3381,41 @@ def comfy_prompt_error_message(status_code: int, error_body: str) -> str:
                 parts.append(f"{label}：{'；'.join(messages[:2])}")
 
     detail = "；".join(part for part in parts if part).strip()
+    if status_code >= 500:
+        return f"ComfyUI 服务异常（HTTP {status_code}）：{detail[:700] or fallback[:500] or '服务端错误'}"
     return f"ComfyUI 拒绝了工作流（HTTP {status_code}）：{detail[:700] or fallback[:500] or '工作流校验失败'}"
+
+def comfy_history_error_message(history_entry) -> str:
+    """ComfyUI 执行完成但失败时（history.status.status_str == 'error'），把节点报错整理成可读文案。"""
+    if not isinstance(history_entry, dict):
+        return ""
+    status_block = history_entry.get("status")
+    if not isinstance(status_block, dict):
+        return ""
+    if str(status_block.get("status_str") or "").lower() != "error":
+        return ""
+    node_id = ""
+    node_type = ""
+    exception_message = ""
+    exception_type = ""
+    for event in status_block.get("messages") or []:
+        if not isinstance(event, (list, tuple)) or len(event) < 2:
+            continue
+        if str(event[0]) != "execution_error":
+            continue
+        payload = event[1]
+        if not isinstance(payload, dict):
+            continue
+        node_id = str(payload.get("node_id") or node_id)
+        node_type = str(payload.get("node_type") or node_type)
+        exception_message = str(payload.get("exception_message") or exception_message)
+        exception_type = str(payload.get("exception_type") or exception_type)
+    if not exception_message and not node_type:
+        return "ComfyUI 执行失败（未返回具体原因）"
+    label = f"节点 {node_id}" + (f"（{node_type}）" if node_type else "") if node_id else (node_type or "")
+    head = f"{label} 执行失败：" if label else "ComfyUI 执行失败："
+    detail = (exception_message or exception_type).strip()
+    return (head + detail[:700]).rstrip("：") if not detail else head + detail[:700]
 
 def get_best_backend(required_images: List[str] = None):
     best_backend = COMFYUI_INSTANCES[0]
@@ -3492,10 +3635,52 @@ def save_to_history(record):
 
 def get_comfy_history(comfy_address, prompt_id):
     try:
-        with urllib.request.urlopen(f"http://{comfy_address}/history/{prompt_id}") as response:
+        with urllib.request.urlopen(f"http://{comfy_address}/history/{prompt_id}", timeout=10) as response:
             return json.loads(response.read())
     except Exception as e:
         return {}
+
+def comfy_prompt_queue_state(comfy_address, prompt_id):
+    """查询任务在 ComfyUI 队列里的状态：running / pending / ''(队列里没有) / None(查询失败)。"""
+    try:
+        with urllib.request.urlopen(f"http://{comfy_address}/queue", timeout=5) as response:
+            data = json.loads(response.read())
+    except Exception:
+        return None
+    for state, key in (("running", "queue_running"), ("pending", "queue_pending")):
+        for item in data.get(key) or []:
+            # /queue 每条是 [编号, prompt_id, prompt, extra_data, outputs_to_execute]
+            if isinstance(item, (list, tuple)) and len(item) > 1 and str(item[1]) == str(prompt_id):
+                return state
+    return ""
+
+def comfy_submit_prompt(comfy_address, payload):
+    """提交渲染任务并返回 prompt_id；连接超时、502/503/504 等临时故障自动重试。
+
+    注意：若某次尝试其实已提交成功、只是响应没收到，重试会再提交一次同一个工作流。
+    """
+    data = json.dumps(payload).encode('utf-8')
+    last_error = ""
+    for attempt in range(1, COMFYUI_SUBMIT_ATTEMPTS + 1):
+        try:
+            post_req = urllib.request.Request(f"http://{comfy_address}/prompt", data=data)
+            prompt_id = json.loads(urllib.request.urlopen(post_req, timeout=COMFYUI_SUBMIT_TIMEOUT).read())['prompt_id']
+            if attempt > 1:
+                print(f"[comfyui] 提交成功（第 {attempt} 次尝试）prompt_id={prompt_id}", flush=True)
+            return prompt_id
+        except urllib.error.HTTPError as e:
+            message = comfy_prompt_error_message(e.code, e.read().decode('utf-8', 'ignore'))
+            if e.code not in COMFYUI_SUBMIT_RETRY_CODES:
+                print(f"[comfyui] 提交失败 ({e.code})：{message}", flush=True)
+                raise Exception(message)
+            last_error = message
+        except Exception as e:
+            last_error = f"{e.__class__.__name__}: {e}" if str(e) else e.__class__.__name__
+        if attempt < COMFYUI_SUBMIT_ATTEMPTS:
+            print(f"[comfyui] 提交异常（{last_error}），{COMFYUI_SUBMIT_RETRY_DELAY:g}s 后重试（第 {attempt + 1}/{COMFYUI_SUBMIT_ATTEMPTS} 次）", flush=True)
+            time.sleep(COMFYUI_SUBMIT_RETRY_DELAY)
+    print(f"[comfyui] 提交失败：已重试 {COMFYUI_SUBMIT_ATTEMPTS} 次仍未成功（{last_error}）", flush=True)
+    raise Exception(f"ComfyUI 提交失败（已重试 {COMFYUI_SUBMIT_ATTEMPTS} 次）：{last_error}")
 
 def safe_user_id(user_id, request: Request):
     candidate = (user_id or "").strip()
@@ -11839,7 +12024,9 @@ async def upload_image(files: List[UploadFile] = File(...)):
         for addr in COMFYUI_INSTANCES:
             try:
                 files_data = {'image': (file.filename, content, file.content_type)}
-                response = requests.post(f"http://{addr}/upload/image", files=files_data, timeout=5)
+                # 放到线程里执行：requests 是同步阻塞库，直接 await 会卡死整个事件循环
+                # （远端 ComfyUI 假死时连接不断开、也不读数据，send 会无限阻塞，导致本地服务所有请求超时）
+                response = await asyncio.to_thread(requests.post, f"http://{addr}/upload/image", files=files_data, timeout=5)
                 if response.status_code == 200:
                     last_result = response.json()
                     success_count += 1
@@ -11949,8 +12136,8 @@ async def upload_comfyui_base64(payload: Base64UploadRequest):
     comfy_name = None
     for addr in COMFYUI_INSTANCES:
         try:
-            resp = requests.post(f"http://{addr}/upload/image",
-                                 files={'image': (filename, content, ct or 'image/png')}, timeout=10)
+            resp = await asyncio.to_thread(requests.post, f"http://{addr}/upload/image",
+                                           files={'image': (filename, content, ct or 'image/png')}, timeout=10)
             if resp.status_code == 200:
                 comfy_name = resp.json().get("name", filename)
         except Exception as exc:
@@ -18209,26 +18396,36 @@ def generate(req: GenerateRequest):
         with open(workflow_path, 'r', encoding='utf-8') as f:
             workflow = json.load(f)
 
+        # config 里映射的「输出图像」节点：命中时把它的结果排在输出列表前面，
+        # 避免工作流里存在多个输出节点时，接口返回的第一张图不是用户映射的那张。
+        output_node = ""
+        try:
+            cfg_file = workflow_config_path(req.workflow_json)
+            if os.path.exists(cfg_file):
+                with open(cfg_file, "r", encoding="utf-8") as f:
+                    output_node = str((json.load(f) or {}).get("output_node") or "")
+        except Exception:
+            output_node = ""
+
         seed = random.randint(1, 4294967295)
 
-        if "23" in workflow and req.prompt:
-            workflow["23"]["inputs"]["text"] = req.prompt
-        if "144" in workflow:
-            workflow["144"]["inputs"]["width"] = req.width
-            workflow["144"]["inputs"]["height"] = req.height
-        if "22" in workflow:
-            workflow["22"]["inputs"]["seed"] = seed
-        if "158" in workflow:
-            workflow["158"]["inputs"]["noise_seed"] = seed
-        for node_id in ["146", "181"]:
-            if node_id in workflow and "inputs" in workflow[node_id] and "seed" in workflow[node_id]["inputs"]:
-                workflow[node_id]["inputs"]["seed"] = seed
-        if "184" in workflow and "inputs" in workflow["184"] and "seed" in workflow["184"]["inputs"]:
-            workflow["184"]["inputs"]["seed"] = seed
-        if "172" in workflow and "inputs" in workflow["172"] and "seed" in workflow["172"]["inputs"]:
-            workflow["172"]["inputs"]["seed"] = seed
-        if "14" in workflow and "inputs" in workflow["14"] and "seed" in workflow["14"]["inputs"]:
-            workflow["14"]["inputs"]["seed"] = seed
+        # 下面这些固定节点 id 的补丁只对内置工作流有效：用户从线上导入的自定义工作流
+        # 节点 id 很容易撞车（例如 22 号是 VAEDecode、23 号是 PreviewImage、14 号是采样器），
+        # 无条件写进去会塞出节点不认识的输入，导致 ComfyUI 校验失败。自定义工作流的输入
+        # 一律由 config 字段映射（req.params）驱动。
+        if is_builtin_workflow(req.workflow_json):
+            if "23" in workflow and req.prompt:
+                workflow["23"]["inputs"]["text"] = req.prompt
+            if "144" in workflow:
+                workflow["144"]["inputs"]["width"] = req.width
+                workflow["144"]["inputs"]["height"] = req.height
+            if "22" in workflow:
+                workflow["22"]["inputs"]["seed"] = seed
+            if "158" in workflow:
+                workflow["158"]["inputs"]["noise_seed"] = seed
+            for node_id in ["146", "181", "184", "172", "14"]:
+                if node_id in workflow and "inputs" in workflow[node_id] and "seed" in workflow[node_id]["inputs"]:
+                    workflow[node_id]["inputs"]["seed"] = seed
 
         for node_id, node_inputs in req.params.items():
             if node_id in workflow:
@@ -18247,15 +18444,15 @@ def generate(req: GenerateRequest):
                 }
 
         p = {"prompt": workflow, "client_id": CLIENT_ID}
-        data = json.dumps(p).encode('utf-8')
-        try:
-            post_req = urllib.request.Request(f"http://{target_backend}/prompt", data=data)
-            prompt_id = json.loads(urllib.request.urlopen(post_req, timeout=10).read())['prompt_id']
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8')
-            raise Exception(comfy_prompt_error_message(e.code, error_body))
+        print(f"[comfyui] 提交渲染 backend={target_backend} workflow={req.workflow_json} type={req.type} params={runtime_log_params_summary(req.params)}", flush=True)
+        prompt_id = comfy_submit_prompt(target_backend, p)
+        print(f"[comfyui] 已进入队列 prompt_id={prompt_id}", flush=True)
 
         history_data = None
+        wait_started = time.time()
+        last_beat = wait_started
+        last_queue_state = ""
+        missing_checks = 0
         for i in range(COMFYUI_HISTORY_TIMEOUT):
             try:
                 res = get_comfy_history(target_backend, prompt_id)
@@ -18264,10 +18461,33 @@ def generate(req: GenerateRequest):
                     break
             except Exception:
                 pass
+            queue_state = comfy_prompt_queue_state(target_backend, prompt_id)
+            if queue_state:
+                missing_checks = 0
+                last_queue_state = queue_state
+            elif queue_state == "":
+                # 历史和队列里都找不到该任务：ComfyUI 重启/任务被清掉时就是这样，
+                # 连续几次仍找不到就判定任务丢失，避免一直空等到超时。
+                missing_checks += 1
+                if missing_checks >= 3:
+                    print(f"[comfyui] 任务丢失 prompt_id={prompt_id}：ComfyUI 队列与历史中都没有该任务（服务重启或被清除）", flush=True)
+                    raise Exception("ComfyUI 任务已丢失（服务重启或被清除），未拿到渲染结果")
+            now = time.time()
+            if now - last_beat >= 10:
+                last_beat = now
+                print(f"[comfyui] 渲染中 prompt_id={prompt_id} 已等待 {int(now - wait_started)}s 队列={last_queue_state or '查询中'}", flush=True)
             time.sleep(1)
 
         if not history_data:
+            print(f"[comfyui] 渲染超时 prompt_id={prompt_id} 已等待 {int(time.time() - wait_started)}s（上限 {COMFYUI_HISTORY_TIMEOUT}s）", flush=True)
             raise Exception("ComfyUI 渲染超时")
+
+        # ComfyUI 可能「执行完成但失败」（例如 CUDA OOM）：此时 history 里 outputs 为空、
+        # status.status_str == 'error'。必须把节点报错抛出来，否则前端只会看到"成功但没结果"。
+        history_error = comfy_history_error_message(history_data)
+        if history_error:
+            print(f"[comfyui] 执行失败 prompt_id={prompt_id}：{history_error}", flush=True)
+            raise Exception(history_error)
 
         local_images = []
         local_videos = []
@@ -18300,6 +18520,9 @@ def generate(req: GenerateRequest):
                 kind == "image" and not comfy_class_is_preview(ct)
                 for (_nid, ct, _ok, _it, kind) in file_candidates
             )
+            if output_node:
+                # 稳定排序：被映射的输出节点结果排到最前，其余保持原有顺序
+                file_candidates.sort(key=lambda item: 0 if str(item[0]) == output_node else 1)
             prefix = f"{req.type}_{int(current_timestamp)}_"
             for node_id, class_type, output_key, item, kind in file_candidates:
                 if kind == "image" and has_primary_image and comfy_class_is_preview(class_type):
@@ -18365,11 +18588,13 @@ def generate(req: GenerateRequest):
             "params": req.params
         }
         save_to_history(result)
+        print(f"[comfyui] 渲染完成 prompt_id={prompt_id} 图片={len(local_images)} 视频={len(local_videos)} 其它={len(local_files)}", flush=True)
         if GLOBAL_LOOP:
             asyncio.run_coroutine_threadsafe(manager.broadcast_new_image(result), GLOBAL_LOOP)
         return result
 
     except Exception as e:
+        print(f"[comfyui] 运行失败 workflow={req.workflow_json} type={req.type}: {e}", flush=True)
         return {"images": [], "error": str(e)}
     finally:
         if target_backend:
@@ -18400,11 +18625,21 @@ class WorkflowField(BaseModel):
     step: Optional[float] = None
     options: List[str] = []
     random_enabled: bool = False
+    # true=强制当作提示词输入（画布提示词直接写入该字段）；false=强制当作普通可编辑参数
+    # （即使字段名/类型看起来像提示词）。None=按类型与键名自动判断。
+    bind_prompt: Optional[bool] = None
+    # 媒体字段：true 时该字段接收「同类型的全部引用」，打包进 ComfyUI 的动态多输入
+    # （COMFY_AUTOGROW_V3，如 ref_images / ref_audios），上限 max_items。
+    multi: bool = False
+    max_items: Optional[int] = None
+    # 动态多输入的键前缀（默认按 input 名推测：ref_images -> ref_image_）
+    prefix: str = ""
 
 class WorkflowConfig(BaseModel):
     title: str = ""
     fields: List[WorkflowField] = []
     mini_cards: Dict[str, Any] = {}
+    output_node: str = ""
 
 class WorkflowUploadRequest(BaseModel):
     name: str
@@ -18939,6 +19174,210 @@ def get_workflow(name: str):
             pass
     return {"name": name, "workflow": workflow, "config": cfg, "builtin": is_builtin_workflow(name)}
 
+# --- 工作流输入/输出自动映射 ---
+# 线上导出的 ComfyUI 工作流节点 id 与命名各不相同，导入时自动识别
+# 「文本输入 / 随机种子 / 输出图像」并生成默认映射，省去在工作流设置页逐项勾选。
+
+COMFY_PROMPT_STRONG_KEYS = {"text", "prompt", "positive", "positive_prompt", "caption"}
+COMFY_PROMPT_LOOSE_KEYS = {"value", "string", "content", "text_value"}
+COMFY_PROMPT_CLASS_HINTS = ("cliptextencode", "textencode", "texttranslate", "text", "string", "prompt", "primitive")
+COMFY_SEED_KEYS = {"noise_seed", "seed", "rand_seed"}
+COMFY_SEED_CLASS_HINTS = ("randomnoise", "sampler", "noise", "seed")
+
+COMFY_MEDIA_CLASS_KINDS = (
+    ("loadimage", "image"),
+    ("loadaudio", "audio"),
+    ("loadvideo", "video"),
+)
+# 动态多输入（COMFY_AUTOGROW_V3）的键名形态：ref_images.ref_image_0
+COMFY_AUTOGROW_KEY_RE = re.compile(r"^(?P<base>[A-Za-z0-9_]+)\.(?P<slot>[A-Za-z0-9_]+)_(?P<index>\d+)$")
+
+def comfy_class_media_kind(class_type) -> str:
+    """按节点 class_type 判断它加载的是哪种媒体（image/audio/video）。"""
+    name = str(class_type or "").lower().replace("_", "").replace(" ", "")
+    for hint, kind in COMFY_MEDIA_CLASS_KINDS:
+        if hint in name:
+            return kind
+    return ""
+
+def comfy_node_has_media_inputs(node) -> bool:
+    """节点是否消费媒体引用（存在 COMFY_AUTOGROW_V3 形式的输入）。"""
+    inputs = node.get("inputs") if isinstance(node, dict) else None
+    if not isinstance(inputs, dict):
+        return False
+    for key, value in inputs.items():
+        if COMFY_AUTOGROW_KEY_RE.match(str(key)) and isinstance(value, list) and value:
+            return True
+    return False
+
+def comfy_class_hint_match(class_type, hints) -> bool:
+    class_name = str(class_type or "").lower().replace("_", "").replace(" ", "")
+    return any(hint in class_name for hint in hints)
+
+def comfy_guess_prompt_field(workflow):
+    """识别工作流里作为「文本输入」的字面量字段（提示词）。
+
+    消费媒体引用的节点（如参考生视频）上的 prompt 输入优先：它才是真正驱动
+    生成的必填文本，即使当前为空也要映射，保证「文字必选」。"""
+    best = None
+    best_score = -1
+    for node_id, node in (workflow or {}).items():
+        if not isinstance(node, dict):
+            continue
+        class_type = str(node.get("class_type") or "")
+        if comfy_class_is_debug_text(class_type):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        hinted = comfy_class_hint_match(class_type, COMFY_PROMPT_CLASS_HINTS)
+        media_node = comfy_node_has_media_inputs(node)
+        for key, value in inputs.items():
+            name = str(key).lower()
+            if "negative" in name or not isinstance(value, str):
+                continue
+            if not value.strip() and not (media_node and name in COMFY_PROMPT_STRONG_KEYS):
+                continue
+            if name in COMFY_PROMPT_STRONG_KEYS:
+                score = 3 + (1 if hinted else 0) + (2 if media_node else 0)
+            elif name in COMFY_PROMPT_LOOSE_KEYS and hinted:
+                score = 1
+            else:
+                continue
+            if score > best_score:
+                best_score = score
+                best = {"node": str(node_id), "input": str(key), "value": value}
+    return best
+
+def comfy_guess_seed_field(workflow):
+    """识别工作流里的「随机种子」字段（seed / noise_seed）。"""
+    best = None
+    best_score = -1
+    for node_id, node in (workflow or {}).items():
+        if not isinstance(node, dict):
+            continue
+        class_type = str(node.get("class_type") or "")
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        hinted = comfy_class_hint_match(class_type, COMFY_SEED_CLASS_HINTS)
+        for key, value in inputs.items():
+            name = str(key).lower()
+            if name not in COMFY_SEED_KEYS:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            score = 2 + (2 if name in ("seed", "noise_seed") else 0) + (1 if hinted else 0)
+            if score > best_score:
+                best_score = score
+                best = {"node": str(node_id), "input": str(key), "value": value}
+    return best
+
+def comfy_guess_media_fields(workflow):
+    """识别工作流里实际存在的「动态多输入」媒体引用（如 ref_images.ref_image_0）。
+
+    只有工作流真实带有对应输入时才会被识别出来，画布据此决定是否启用
+    参考图片 / 参考音频等入口：工作流没有该项输入就不启用。"""
+    found: Dict[tuple, Dict[str, Any]] = {}
+    for node_id, node in (workflow or {}).items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        for key, value in inputs.items():
+            match = COMFY_AUTOGROW_KEY_RE.match(str(key))
+            if not match or not isinstance(value, list) or not value:
+                continue
+            source = workflow.get(str(value[0]))
+            if not isinstance(source, dict):
+                continue
+            kind = comfy_class_media_kind(source.get("class_type"))
+            if not kind:
+                continue
+            found.setdefault((str(node_id), match.group("base")), {
+                "node": str(node_id),
+                "input": match.group("base"),
+                "slot": match.group("slot"),
+                "kind": kind,
+            })
+    return list(found.values())
+
+def comfy_guess_output_node(workflow) -> str:
+    """识别工作流里的「输出图像」节点，优先 SaveImage，其次是 PreviewImage。"""
+    best = ""
+    best_rank = 0
+    for node_id, node in (workflow or {}).items():
+        if not isinstance(node, dict):
+            continue
+        class_name = str(node.get("class_type") or "").lower().replace("_", "").replace(" ", "")
+        if "saveimage" in class_name or "imagesave" in class_name:
+            rank = 2
+        elif "previewimage" in class_name:
+            rank = 1
+        else:
+            rank = 0
+        if rank > best_rank:
+            best_rank = rank
+            best = str(node_id)
+    return best
+
+def comfy_auto_workflow_config(workflow, name: str = "") -> Dict[str, Any]:
+    """按识别结果生成默认映射配置（文本输入 + 随机种子 + 媒体输入 + 输出图像）。"""
+    fields: List[Dict[str, Any]] = []
+    prompt_hit = comfy_guess_prompt_field(workflow)
+    if prompt_hit:
+        fields.append({
+            "id": "f_prompt",
+            "node": prompt_hit["node"],
+            "input": prompt_hit["input"],
+            "name": "提示词文本",
+            "type": "textarea",
+            "default": prompt_hit["value"],
+            "min": None,
+            "max": None,
+            "step": None,
+            "options": [],
+            "random_enabled": False,
+        })
+    seed_hit = comfy_guess_seed_field(workflow)
+    if seed_hit:
+        fields.append({
+            "id": "f_seed",
+            "node": seed_hit["node"],
+            "input": seed_hit["input"],
+            "name": "随机种子",
+            "type": "number",
+            "default": seed_hit["value"],
+            "min": None,
+            "max": None,
+            "step": 1,
+            "options": [],
+            "random_enabled": True,
+        })
+    for media in comfy_guess_media_fields(workflow):
+        fields.append({
+            "id": f"f_{media['input']}",
+            "node": media["node"],
+            "input": media["input"],
+            "name": {"image": "参考图片", "audio": "参考音频", "video": "参考视频"}.get(media["kind"], media["kind"]),
+            "type": media["kind"],
+            "default": "",
+            "min": None,
+            "max": None,
+            "step": None,
+            "options": [],
+            "random_enabled": False,
+            "multi": True,
+            "prefix": f"{media['slot']}_",
+        })
+    return {
+        "title": os.path.splitext(os.path.basename(str(name or "")))[0] or "工作流",
+        "fields": fields,
+        "mini_cards": {},
+        "output_node": comfy_guess_output_node(workflow),
+    }
+
 @app.post("/api/workflows")
 def upload_workflow(payload: WorkflowUploadRequest):
     name = os.path.basename(payload.name.strip())
@@ -18958,7 +19397,15 @@ def upload_workflow(payload: WorkflowUploadRequest):
     path = workflow_path_from_name(stored_name)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload.workflow, f, ensure_ascii=False, indent=2)
-    return {"name": stored_name}
+    # 首次导入且没有映射配置时，自动生成「文本输入 / 随机种子 / 输出图像」映射
+    auto_config = None
+    cfg_path = workflow_config_path(stored_name)
+    if not os.path.exists(cfg_path):
+        auto_config = comfy_auto_workflow_config(payload.workflow, name=name)
+        if auto_config["fields"] or auto_config["output_node"]:
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(auto_config, f, ensure_ascii=False, indent=2)
+    return {"name": stored_name, "config": auto_config}
 
 @app.put("/api/workflows/{name:path}/config")
 def save_workflow_config(name: str, payload: WorkflowConfig):
