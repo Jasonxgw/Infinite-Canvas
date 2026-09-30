@@ -1,0 +1,608 @@
+{
+  "21": {
+    "inputs": {
+      "value": 1024
+    },
+    "class_type": "easy int",
+    "_meta": {
+      "title": "整数"
+    }
+  },
+  "22": {
+    "inputs": {
+      "value": 1536
+    },
+    "class_type": "easy int",
+    "_meta": {
+      "title": "整数"
+    }
+  },
+  "37": {
+    "inputs": {
+      "width": [
+        "21",
+        0
+      ],
+      "height": [
+        "22",
+        0
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "空Latent图像"
+    }
+  },
+  "128": {
+    "inputs": {
+      "text": "Full character turnaround sheet on a plain neutral seamless mid-grey backdrop, three full-body views of the same person standing side by side in a row: front view on the left, left profile view in the centre, back view on the right. Identical pose in all three views — arms relaxed at the sides, feet shoulder-width apart, head level, neutral expression, mouth closed. Consistent scale across views, eye-level camera, identical even lighting on all three. Full body head-to-toe visible in every view, generous margin around the figure.\na sixteen-year-old East Asian boy, adolescent with smooth unlined cheeks, slender but sinewy build hardened by three years of hauling ore, gaunt hollow-cheeked face, skin tanned a dusty yellow-grey with dark grit settled in the creases, dark brown eyes, the left iris carrying a thin frost-like ring of pale silver, black hair slightly long and unbound with loose strands falling across the right brow.\nThe back view shows a rope burn scar across the right shoulder, healed and cracked open again at the edges, and a back laced with old scar tissue overlaid by a set of newer straight linear scars.\nHe wears a faded coarse hemp short jacket washed pale and split at the elbows, a plain hemp rope knotted at the waist, a ragged uneven hem, and is barefoot with mud-dark soles.\nAt his waist hangs a short knife a foot and three inches long, its blade carrying three deep nicks, its grip wrapped in old cloth worn concave into the exact shape of a hand; a small heavy black iron token, palm-sized, hangs at his chest on a cord, its faces carved with short worn characters smoothed by years of handling.\nPhotorealistic live-action costume test photograph, real human being, shot on ARRI Alexa with a 50mm lens at eye level, soft even studio key light from the front with subtle fill from both sides, flat neutral background, natural unretouched skin with visible pores, fine lines, uneven tone and blemishes, matte skin with no highlights, natural colour grading, plain documentary wardrobe-test lighting, no stylisation, 4K detail, 3:2\nnegative: illustration, painting, digital art, concept art, 3D render, CGI, anime, cel shading, cartoon, plastic skin, airbrushed skin, beauty filter, glamour lighting, fashion model pose, glossy hair, oversaturated colours, modern clothing, extra limbs, different faces between views, inconsistent character, three different people, changing proportions between views, watermark, text, logo"
+    },
+    "class_type": "CR Text",
+    "_meta": {
+      "title": "手动输入"
+    }
+  },
+  "129": {
+    "inputs": {
+      "Input": 1,
+      "text1": [
+        "133:151",
+        0
+      ],
+      "text2": [
+        "128",
+        0
+      ]
+    },
+    "class_type": "CR Text Input Switch",
+    "_meta": {
+      "title": "🔀 CR Text Input Switch"
+    }
+  },
+  "132": {
+    "inputs": {
+      "output_path": "[time(%Y-%m-%d)]",
+      "filename_prefix": "ComfyUI",
+      "filename_delimiter": "_",
+      "filename_number_padding": 4,
+      "filename_number_start": "false",
+      "extension": "jpg",
+      "dpi": 300,
+      "quality": 100,
+      "optimize_image": "true",
+      "lossless_webp": "false",
+      "overwrite_mode": "false",
+      "show_history": "false",
+      "show_history_by_prefix": "false",
+      "embed_workflow": "false",
+      "show_previews": "true",
+      "images": [
+        "150:91",
+        0
+      ]
+    },
+    "class_type": "Image Save",
+    "_meta": {
+      "title": "保存图像"
+    }
+  },
+  "148": {
+    "inputs": {
+      "seed": 0
+    },
+    "class_type": "CR Seed",
+    "_meta": {
+      "title": "🌱 CR Seed"
+    }
+  },
+  "133:126": {
+    "inputs": {
+      "delimiter": ", ",
+      "clean_whitespace": "true",
+      "text_a": [
+        "133:125",
+        0
+      ],
+      "text_b": [
+        "128",
+        0
+      ]
+    },
+    "class_type": "Text Concatenate",
+    "_meta": {
+      "title": "文本连锁"
+    }
+  },
+  "133:152": {
+    "inputs": {
+      "model": "Qwen3.5-9B-Q5_K_M.gguf",
+      "mmproj": "None",
+      "chat_handler": "None",
+      "n_ctx": 8192,
+      "vram_limit": -1,
+      "image_min_tokens": 0,
+      "image_max_tokens": 0
+    },
+    "class_type": "llama_cpp_model_loader",
+    "_meta": {
+      "title": "Llama-cpp Model Loader"
+    }
+  },
+  "133:151": {
+    "inputs": {
+      "preset_prompt": "Normal - Describe",
+      "custom_prompt": "",
+      "system_prompt": [
+        "133:126",
+        0
+      ],
+      "inference_mode": "one by one",
+      "max_frames": 24,
+      "max_size": 256,
+      "seed": 579011415600395,
+      "force_offload": false,
+      "save_states": false,
+      "llama_model": [
+        "133:152",
+        0
+      ]
+    },
+    "class_type": "llama_cpp_instruct_adv",
+    "_meta": {
+      "title": "Llama-cpp Instruct"
+    }
+  },
+  "133:153": {
+    "inputs": {
+      "text_0": "请生成一张高度写实、具备真实照片质感的全身角色转身参考图（Full Character Turnaround Sheet），画面背景为纯中性无缝的深灰色调，图中并排站立着同一位十六岁的东亚少年，呈现出左中右三种视角：左侧为正脸全身像，中间为左侧面全身像，右侧为背面全身像，三幅视图中的姿势完全一致，双臂自然下垂放松，双脚分开与肩同宽，头部保持水平，表情平静自然，嘴唇闭合，无任何夸张动作。该少年身形瘦削却肌肉线条紧实，是三年负重运矿石留下的劳碌痕迹，脸颊光滑无皱纹但略显消瘦凹陷，皮肤呈现被烈日暴晒后的尘黄色灰调，眼窝处积有深色尘埃，拥有一双深棕色眼眸，其中左眼虹膜上隐约环绕着一圈如薄霜般的淡银色光晕；他的黑色头发稍长且未束起，几缕碎发随意垂落在右眉上方。从背面视角可清晰看到他右肩上一道陈旧的绳索灼烧疤痕，伤口边缘已愈合却又再次裂开，背部脊背处交织着陈年的增生疤痕组织，上面覆盖着一道道较新的笔直线性伤疤。他身着一件褪色粗糙的亚麻短夹克，洗得发白并在肘部处磨破裂开，腰间系着一条朴素的麻绳，衣摆参差不齐且破旧，赤脚站立，脚底沾满深色的泥土。在他的腰带上挂着一把约一英尺三英寸长的短刀，刀刃上有三道深切的缺口，刀柄用旧布缠绕，因长期握持而凹陷出贴合手型的形状；胸前颈绳上还挂着一枚掌大的沉重黑色铁质令牌，两面刻有因岁月摩挲而变得模糊的简短字符。整体画面采用平视视角，50mm 镜头拍摄，光线为正面柔和均匀的影棚主光，辅以两侧微弱的补光，确保三幅视图光照完全一致，无阴影干扰，展现从头顶到脚底的完整细节，人物周围留有充足的留白空间。皮肤质感必须真实未修饰，清晰可见毛孔、细微纹路、肤色不均及瑕疵，呈现哑光无高光效果，色彩自然，无任何美化滤镜或过度饱和，风格严格限定为纪录片式的服装测试实拍，拒绝任何插画、绘画、数字艺术、概念设计、3D 渲染、CGI、动漫、赛璐璐上色、卡通风格，杜绝塑料感皮肤、空气brushed 皮肤、美容滤镜、时尚模特姿势、光泽头发、过度饱和色彩、现代服饰、多余肢体、多视图面孔不一致、比例失调、水印、文字或标志。",
+      "text": [
+        "133:151",
+        0
+      ]
+    },
+    "class_type": "ShowText|pysssss",
+    "_meta": {
+      "title": "Show Text 🐍"
+    }
+  },
+  "133:125": {
+    "inputs": {
+      "text": "你是一个提示词专家，根据用户输入的内容扩写并润色，并输出详细的提示词，提示词要求中文自然语言一段输出，无需多余的结构；提示词要求包含主体，人物的年龄，人种，发型，服装，表情，动作，场景环境，景别，角度，光照，氛围等尽可能详细的内容。\n1.如果用户无输入，则自行按照格式随机发挥\n2.如用户没有限定人种，那默认为亚洲人种\n3.如用户没有限定年龄，那默认为18-20岁\n4.如用户没有限定风格，那默认为写实，随拍，真实照片质感\n用户的内容是："
+    },
+    "class_type": "CR Text",
+    "_meta": {
+      "title": "手动输入"
+    }
+  },
+  "149:135": {
+    "inputs": {
+      "use_zero_init": true,
+      "zero_init_steps": 0,
+      "model": [
+        "149:140",
+        0
+      ]
+    },
+    "class_type": "CFGZeroStarAndInit",
+    "_meta": {
+      "title": "CFG Zero Star/Init"
+    }
+  },
+  "149:136": {
+    "inputs": {
+      "text": [
+        "149:147",
+        0
+      ],
+      "clip": [
+        "149:141",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP文本编码"
+    }
+  },
+  "149:137": {
+    "inputs": {
+      "text": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走，雀斑，痤疮，痘痘",
+      "clip": [
+        "149:141",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP文本编码"
+    }
+  },
+  "149:138": {
+    "inputs": {
+      "shift": 1.0000000000000002,
+      "model": [
+        "149:145",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingSD3",
+    "_meta": {
+      "title": "采样算法（SD3）"
+    }
+  },
+  "149:139": {
+    "inputs": {
+      "add_noise": "enable",
+      "noise_seed": [
+        "148",
+        0
+      ],
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "beta",
+      "start_at_step": 0,
+      "end_at_step": 4,
+      "return_with_leftover_noise": "disable",
+      "model": [
+        "149:138",
+        0
+      ],
+      "positive": [
+        "149:136",
+        0
+      ],
+      "negative": [
+        "149:137",
+        0
+      ],
+      "latent_image": [
+        "37",
+        0
+      ]
+    },
+    "class_type": "KSamplerAdvanced",
+    "_meta": {
+      "title": "K采样器（高级）"
+    }
+  },
+  "149:140": {
+    "inputs": {
+      "unet_name": "Wan2.1-KL/Wan2_1-T2V-14B_fp8_e4m3fn.safetensors",
+      "weight_dtype": "fp8_e4m3fn"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "149:141": {
+    "inputs": {
+      "clip_name": "Wan_2.1_ComfyUI_repackaged_text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "加载CLIP"
+    }
+  },
+  "149:142": {
+    "inputs": {
+      "vae_name": "Comfy-Org/wan_2.1_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "149:143": {
+    "inputs": {
+      "lora_name": "Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors",
+      "strength_model": 0.9,
+      "model": [
+        "149:135",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA加载器（仅模型）"
+    }
+  },
+  "149:144": {
+    "inputs": {
+      "lora_name": "WAN2.2-LowNoise_SmartphoneSnapshotPhotoReality_v3_by-Al_Characters.safetensors",
+      "strength_model": 0.7,
+      "model": [
+        "149:143",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA加载器（仅模型）"
+    }
+  },
+  "149:145": {
+    "inputs": {
+      "lora_name": "Wan2.1_T2V_14B_FusionX_LoRA.safetensors",
+      "strength_model": 0.3,
+      "model": [
+        "149:144",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA加载器（仅模型）"
+    }
+  },
+  "149:146": {
+    "inputs": {
+      "samples": [
+        "149:139",
+        0
+      ],
+      "vae": [
+        "149:142",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "149:147": {
+    "inputs": {
+      "offload_model": true,
+      "offload_cache": true,
+      "anything": [
+        "129",
+        0
+      ]
+    },
+    "class_type": "VRAMCleanup",
+    "_meta": {
+      "title": "🎈VRAM-Cleanup"
+    }
+  },
+  "150:61": {
+    "inputs": {
+      "shift": 3.1000000000000005,
+      "model": [
+        "150:47",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingAuraFlow",
+    "_meta": {
+      "title": "采样算法（AuraFlow）"
+    }
+  },
+  "150:50": {
+    "inputs": {
+      "clip_name": "qwen_3_4b.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "加载CLIP"
+    }
+  },
+  "150:51": {
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "150:43": {
+    "inputs": {
+      "pixels": [
+        "150:123",
+        0
+      ],
+      "vae": [
+        "150:51",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE编码"
+    }
+  },
+  "150:94": {
+    "inputs": {
+      "model": "ema_vae_fp16.safetensors",
+      "device": "cuda:0",
+      "encode_tiled": true,
+      "encode_tile_size": 1024,
+      "encode_tile_overlap": 128,
+      "decode_tiled": true,
+      "decode_tile_size": 1024,
+      "decode_tile_overlap": 128,
+      "tile_debug": "false",
+      "offload_device": "none",
+      "cache_model": false
+    },
+    "class_type": "SeedVR2LoadVAEModel",
+    "_meta": {
+      "title": "SeedVR2 (Down)Load VAE Model"
+    }
+  },
+  "150:92": {
+    "inputs": {
+      "model": "seedvr2_ema_7b-Q4_K_M.gguf",
+      "device": "cuda:0",
+      "blocks_to_swap": 36,
+      "swap_io_components": true,
+      "offload_device": "cpu",
+      "cache_model": false,
+      "attention_mode": "sageattn_2"
+    },
+    "class_type": "SeedVR2LoadDiTModel",
+    "_meta": {
+      "title": "SeedVR2 (Down)Load DiT Model"
+    }
+  },
+  "150:46": {
+    "inputs": {
+      "text": [
+        "149:147",
+        0
+      ],
+      "clip": [
+        "150:50",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP文本编码"
+    }
+  },
+  "150:44": {
+    "inputs": {
+      "conditioning": [
+        "150:46",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "条件零化"
+    }
+  },
+  "150:54": {
+    "inputs": {
+      "add_noise": "enable",
+      "noise_seed": [
+        "148",
+        0
+      ],
+      "steps": 10,
+      "cfg": 1,
+      "sampler_name": "ddim",
+      "scheduler": "ddim_uniform",
+      "start_at_step": 3,
+      "end_at_step": 10000,
+      "return_with_leftover_noise": "disable",
+      "model": [
+        "150:61",
+        0
+      ],
+      "positive": [
+        "150:46",
+        0
+      ],
+      "negative": [
+        "150:44",
+        0
+      ],
+      "latent_image": [
+        "150:43",
+        0
+      ]
+    },
+    "class_type": "KSamplerAdvanced",
+    "_meta": {
+      "title": "K采样器（高级）"
+    }
+  },
+  "150:52": {
+    "inputs": {
+      "samples": [
+        "150:54",
+        0
+      ],
+      "vae": [
+        "150:51",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "150:47": {
+    "inputs": {
+      "unet_name": "z_image_turbo_bf16.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "150:123": {
+    "inputs": {
+      "offload_model": true,
+      "offload_cache": true,
+      "anything": [
+        "149:146",
+        0
+      ]
+    },
+    "class_type": "VRAMCleanup",
+    "_meta": {
+      "title": "🎈VRAM-Cleanup"
+    }
+  },
+  "150:124": {
+    "inputs": {
+      "offload_model": true,
+      "offload_cache": true,
+      "anything": [
+        "150:52",
+        0
+      ]
+    },
+    "class_type": "VRAMCleanup",
+    "_meta": {
+      "title": "🎈VRAM-Cleanup"
+    }
+  },
+  "150:91": {
+    "inputs": {
+      "seed": [
+        "148",
+        0
+      ],
+      "resolution": 3072,
+      "max_resolution": 0,
+      "batch_size": 1,
+      "uniform_batch_size": true,
+      "color_correction": "lab",
+      "temporal_overlap": 0,
+      "prepend_frames": 0,
+      "input_noise_scale": 0,
+      "latent_noise_scale": 0,
+      "offload_device": "cpu",
+      "enable_debug": false,
+      "image": [
+        "150:124",
+        0
+      ],
+      "dit": [
+        "150:92",
+        0
+      ],
+      "vae": [
+        "150:94",
+        0
+      ]
+    },
+    "class_type": "SeedVR2VideoUpscaler",
+    "_meta": {
+      "title": "SeedVR2 Video Upscaler (v2.5.24)"
+    }
+  }
+}

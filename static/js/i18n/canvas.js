@@ -329,6 +329,8 @@
         "canvas.comfyNoWorkflow": { zh: "请先在 ComfyUI 设置中保存工作流。", en: "Save a workflow in ComfyUI Settings first." },
         "canvas.comfyLoadingWorkflow": { zh: "正在读取工作流参数...", en: "Loading workflow parameters..." },
         "canvas.comfyNoExtraParams": { zh: "这个工作流只有图片/提示词输入，没有额外参数。", en: "This workflow only has image/prompt inputs and no extra parameters." },
+        "canvas.comfyFreeMemory": { zh: "运行前回收显存/内存", en: "Reclaim VRAM/RAM before run" },
+        "canvas.comfyFreeMemoryHint": { zh: "默认关闭。开启后每次提交前让远端卸载驻留模型，显存更干净，代价是这次要重新加载模型。", en: "Off by default. Unloads cached models on the remote before each submit for a cleaner VRAM state, at the cost of reloading them." },
         "canvas.ltxDirector": { zh: "LTX Director", en: "LTX Director" },
         "canvas.ltxDurationSec": { zh: "秒数", en: "Seconds" },
         "canvas.ltxDurationFrames": { zh: "帧数", en: "Frames" },

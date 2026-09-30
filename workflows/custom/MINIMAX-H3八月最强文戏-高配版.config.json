@@ -1,0 +1,163 @@
+{
+  "title": "MINIMAX-H3八月最强文戏-高配版",
+  "fields": [
+    {
+      "id": "f_prompt",
+      "node": "167",
+      "input": "prompt",
+      "name": "提示词文本",
+      "type": "textarea",
+      "default": "<Subject1>Lin Yan是<Picture 1>画面中央的十六岁少年，黑发略长不束、额前碎发遮住左眼，眉平而直，深褐色瞳，眼神半垂、平静不看人；灰褐色粗麻短褐，袖口磨破、下摆参差，腰间一根麻绳，绳上挂一只小干粮布袋；赤脚，脚背有旧疤；手背矿灰洗不掉，虎口与指根有厚茧；右肩麻绳勒进皮肉，那里的皮烂过一次、结了痂、痂上又裂开。保留参考图中的面部特征、发型、服装、身材比例、眼镜（如有）、关键配饰以及整体外貌。\n<Subject1>，S1 永远是说话人。S1始终使用一种固定的声音：16 岁男声，偏低音域，音色哑而干（矿灰嗓）；常态语速慢、音量小、句尾不上扬；被压到底时语速不变；禁止少年感清亮腔，禁止气声矫饰。\n\n<Subject 2>是黑铁峡矿场·栈道与百级木梯场景。\n\n人物站位：黄昏，黑铁峡竖井内部，Lin Yan 位于画面中偏右的栈道上，背朝镜头、身体前倾向上走，右肩压着一只藤条编的满筐矿石，麻绳从他右肩斜勒到左腋；他赤脚踩在糊着厚泥的矿木横档上，头略低，视线落在上一层平台的边缘。栈道下方是三十丈深的竖井，黑得看不见底；井壁上一圈圈栈道盘旋而上；全场只有坑口两盏油灯，光是黄的、照不远，矿灰悬浮在光里吃掉一半亮度。画面无可读文字。\n\n[Shot 1]\n中全景，胸高平视，背跟。Lin Yan 背着满筐矿石沿栈道往上走，麻绳随着步子一下一下勒进右肩那道裂开的痂，筐里的铁石互相摩擦出细碎响声，他一次也没有低头看下面：\n<Subject 1> (S1) says:\n<d>[Chinese]三年了。疼是多余的事。</d>\n\n[Shot 2]\n大特写，贴地仰角。栈道下方三十丈的矿坑，纯黑，边缘只剩一线冷光；一颗碎石从栈道边沿滚落，向下坠了很久，没有回声。\n\n[Shot 3]\n近景，低机位仰角。Lin Yan 停在百级木梯的起点，抬头看了一眼上面那层平台的边缘；他把筐往肩上颠了一下，绳又落回原处那道痂上，脸上没有任何表情变化：\n<Subject 1> (S1) says:\n<d>[Chinese]少一趟，扣半份饭。</d>\n\n[Shot 4]\n中景，背跟仰角。他开始一步一步踩木梯，横档上糊着一层洗不掉的泥，脚掌落下时带起一小撮灰；他只盯着下一级横档：\n<Subject 1> (S1) says:\n<d>[Chinese]多一趟，没有多的。</d>\n\n[Shot 5]\n中景转近景，侧后方平视。他爬到木梯中段停半息，视线越过自己的肩头落在顶端平台；油灯的黄光在平台边沿切成一条横线，照亮他半张脸，另外半张留在黑里：\n<Subject 1> (S1) says:\n<d>[Chinese]今天，第三十趟。</d>\n末帧保持：Lin Yan 停在木梯中段，双手扶横档，筐仍压在右肩，麻绳仍勒在裂开的痂上，身体朝上、视线朝上；矿坑在他身后是一片纯黑，两盏油灯的黄光是画面唯一光源。\n\n【禁止项】\n\n文字/UI/水印/Logo/角标/可读文字/真实UI\n\n【强制声明】\n\n无背景音乐,仅保留环境音与人声和音效;画面禁字幕/文字/水印/Logo;禁止可读文字(指画面字幕文字,不含人声台词)",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false,
+      "bind_prompt": null,
+      "multi": false,
+      "max_items": null,
+      "max_side": null,
+      "prefix": "",
+      "nodes": []
+    },
+    {
+      "id": "f_seed",
+      "node": "11",
+      "input": "noise_seed",
+      "name": "随机种子",
+      "type": "number",
+      "default": 683072603085674,
+      "min": null,
+      "max": null,
+      "step": 1.0,
+      "options": [],
+      "random_enabled": true,
+      "bind_prompt": null,
+      "multi": false,
+      "max_items": null,
+      "max_side": null,
+      "prefix": "",
+      "nodes": []
+    },
+    {
+      "id": "f_ref_images",
+      "node": "7",
+      "input": "ref_images",
+      "name": "参考图片",
+      "type": "image",
+      "default": "",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false,
+      "bind_prompt": null,
+      "multi": true,
+      "max_items": 9,
+      "max_side": 1280,
+      "prefix": "ref_image_",
+      "nodes": [
+        "7",
+        "14"
+      ]
+    },
+    {
+      "id": "f_ref_audios",
+      "node": "7",
+      "input": "ref_audios",
+      "name": "参考音频",
+      "type": "audio",
+      "default": "",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false,
+      "bind_prompt": null,
+      "multi": true,
+      "max_items": null,
+      "max_side": null,
+      "prefix": "ref_audio_",
+      "nodes": [
+        "7",
+        "14"
+      ]
+    },
+    {
+      "id": "f_mb0r9qy",
+      "node": "164",
+      "input": "megapixels",
+      "name": "百万像素",
+      "type": "number",
+      "default": 1,
+      "min": 0.0,
+      "max": 10.0,
+      "step": 0.1,
+      "options": [],
+      "random_enabled": false,
+      "bind_prompt": null,
+      "multi": false,
+      "max_items": null,
+      "max_side": null,
+      "prefix": "",
+      "nodes": []
+    },
+    {
+      "id": "f_ortme15",
+      "node": "164",
+      "input": "aspect_ratio",
+      "name": "aspect_ratio",
+      "type": "text",
+      "default": "16:9 (Widescreen)",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false,
+      "bind_prompt": null,
+      "multi": false,
+      "max_items": null,
+      "max_side": null,
+      "prefix": "",
+      "nodes": []
+    },
+    {
+      "id": "f_23zmmwn",
+      "node": "163",
+      "input": "value",
+      "name": "秒",
+      "type": "number",
+      "default": 10,
+      "min": 1.0,
+      "max": 15.0,
+      "step": 1.0,
+      "options": [],
+      "random_enabled": false,
+      "bind_prompt": null,
+      "multi": false,
+      "max_items": null,
+      "max_side": null,
+      "prefix": "",
+      "nodes": []
+    }
+  ],
+  "mini_cards": {
+    "prompt": {
+      "x": 24,
+      "y": 30
+    },
+    "image": {
+      "x": 24,
+      "y": 210
+    },
+    "custom": {
+      "x": 280,
+      "y": 78
+    },
+    "output": {
+      "x": 540,
+      "y": 120
+    }
+  },
+  "output_node": "208"
+}

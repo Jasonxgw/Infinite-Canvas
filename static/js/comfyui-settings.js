@@ -8,6 +8,8 @@ function refreshLanguageView(){
     renderEditor();
     renderPreview();
     renderWorkspaceView();
+    // 后端地址那几行带着「已连接 / 连接失败」的文案，换语言要跟着重画
+    renderComfyInstances();
     refreshIcons();
 }
 function applyLanguage(){
@@ -205,21 +207,123 @@ function defaultMiniTestNodes(){
 
 // —— ComfyUI 后端地址管理 ——
 let comfyInstances = [];
+// 每台最近一次的检测结果（状态、队列长度、失败原因），按行的下标存
+let comfyStatus = {};
+let comfyCheckTimer = null;
+// 定时检测的间隔：够看出主机掉没掉线，又不至于一直探
+const COMFY_CHECK_INTERVAL = 30000;
+
+function comfyDot(color){
+    return `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${color};flex:none"></span>`;
+}
+
+function comfyStatusHtml(index){
+    const st = comfyStatus[index];
+    if(!st) return `${comfyDot('var(--faint)')}<span style="color:var(--faint)">${escapeHtml(tr('comfy.notChecked'))}</span>`;
+    if(st.state === 'checking') return `${comfyDot('#d97706')}<span style="color:#d97706">${escapeHtml(tr('comfy.checking'))}</span>`;
+    if(st.state === 'fail'){
+        return comfyDot('#dc2626')
+            + `<span style="color:#dc2626">${escapeHtml(tr('comfy.disconnected'))}</span>`
+            + `<span style="color:var(--faint);font-weight:600">${escapeHtml(st.error || '')}</span>`;
+    }
+    const tasks = (st.running || st.pending)
+        ? tf('comfy.hostTasks', { running: st.running, pending: st.pending })
+        : tr('comfy.hostIdle');
+    return comfyDot('#16a34a')
+        + `<span style="color:#16a34a">${escapeHtml(tr('comfy.connected'))}</span>`
+        + `<span style="color:var(--faint);font-weight:600">${escapeHtml(tasks)}</span>`;
+}
+
+function renderComfyStatusRow(index){
+    const el = document.getElementById('comfyStatus' + index);
+    if(el) el.innerHTML = comfyStatusHtml(index);
+}
+
 async function loadComfyInstances(){
     try {
         const data = await fetch('/api/comfyui/instances').then(r => r.json());
         comfyInstances = Array.isArray(data.instances) ? data.instances : [];
+        comfyStatus = {};
         renderComfyInstances();
+        // 进设置页先测一遍，之后按间隔定时测
+        checkComfyInstances(false);
+        startComfyAutoCheck();
     } catch(e){ console.error(e); }
 }
+
+// 检测连接：把框里当前的地址整份发给后端逐台探，没保存的地址也能先测
+async function checkComfyInstances(manual){
+    const targets = comfyInstances
+        .map((addr, i) => ({ i, addr: String(addr || '').trim() }))
+        .filter(t => t.addr);
+    if(!targets.length){
+        if(manual) setStatus(tr('comfy.needAddress'));
+        return;
+    }
+    targets.forEach(t => { comfyStatus[t.i] = { state: 'checking' }; renderComfyStatusRow(t.i); });
+    if(manual) setStatus(tr('comfy.checking'));
+    try {
+        const res = await fetch('/api/comfyui/instances/status', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({ instances: targets.map(t => t.addr) })
+        });
+        if(!res.ok) throw new Error((await res.json()).detail || ('HTTP ' + res.status));
+        const data = await res.json();
+        let okCount = 0;
+        (data.items || []).forEach((row, n) => {
+            const target = targets[n];
+            if(!target) return;
+            if(row.ok){
+                okCount += 1;
+                comfyStatus[target.i] = { state:'ok', running: row.running, pending: row.pending };
+            } else {
+                comfyStatus[target.i] = { state:'fail', error: row.error || '' };
+            }
+            renderComfyStatusRow(target.i);
+        });
+        if(manual) setStatus(tf('comfy.checkSummary', { ok: okCount, fail: targets.length - okCount }));
+    } catch(e){
+        targets.forEach(t => {
+            comfyStatus[t.i] = { state:'fail', error: e.message || '' };
+            renderComfyStatusRow(t.i);
+        });
+        if(manual) setStatus(tr('comfy.checkFailed'));
+    }
+}
+
+function startComfyAutoCheck(){
+    stopComfyAutoCheck();
+    comfyCheckTimer = setInterval(() => {
+        // 设置页没在显示（切到别的页签 / 被画布盖住）就跳过这一轮，别白探
+        if(document.visibilityState !== 'visible') return;
+        const box = document.getElementById('comfyInstancesList');
+        if(box && !box.offsetParent) return;
+        checkComfyInstances(false);
+    }, COMFY_CHECK_INTERVAL);
+}
+
+function stopComfyAutoCheck(){
+    if(comfyCheckTimer) clearInterval(comfyCheckTimer);
+    comfyCheckTimer = null;
+}
+
+function toggleComfyAutoCheck(on){
+    if(on) startComfyAutoCheck();
+    else stopComfyAutoCheck();
+}
+
 function renderComfyInstances(){
     const el = document.getElementById('comfyInstancesList');
     if(!el) return;
     el.innerHTML = comfyInstances.map((addr, i) => `
-        <div style="display:flex;align-items:center;gap:6px;padding:4px;border:1px solid var(--line);border-radius:9px;background:var(--soft)">
-            <span style="width:18px;text-align:center;font-size:10.5px;color:var(--faint);font-weight:800">${i + 1}</span>
-            <input class="small-input" type="text" value="${escapeAttr(addr)}" placeholder="host:port" oninput="updateComfyInstance(${i}, this.value)" style="flex:1;height:28px;padding:0 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--text);font-size:12px;font-family:ui-monospace,Menlo,monospace">
-            <button class="opt-del" type="button" onclick="removeComfyInstance(${i})" title="删除"><i data-lucide="x" class="w-3 h-3"></i></button>
+        <div style="display:flex;flex-direction:column;gap:5px;padding:6px;border:1px solid var(--line);border-radius:9px;background:var(--soft)">
+            <div style="display:flex;align-items:center;gap:6px">
+                <span style="width:18px;text-align:center;font-size:10.5px;color:var(--faint);font-weight:800">${i + 1}</span>
+                <input class="small-input" type="text" value="${escapeAttr(addr)}" placeholder="host:port 或 WaaS 域名" oninput="updateComfyInstance(${i}, this.value)" style="flex:1;height:28px;padding:0 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--text);font-size:12px;font-family:ui-monospace,Menlo,monospace">
+                <button class="opt-del" type="button" onclick="removeComfyInstance(${i})" title="删除"><i data-lucide="x" class="w-3 h-3"></i></button>
+            </div>
+            <div id="comfyStatus${i}" style="display:flex;align-items:center;gap:5px;padding-left:24px;font-size:10.5px;font-weight:700">${comfyStatusHtml(i)}</div>
         </div>
     `).join('');
     refreshIcons();
@@ -230,9 +334,13 @@ function addComfyInstance(){
 }
 function updateComfyInstance(index, value){
     comfyInstances[index] = value;
+    // 地址改了，之前那次检测结果就不作数了
+    delete comfyStatus[index];
+    renderComfyStatusRow(index);
 }
 function removeComfyInstance(index){
     comfyInstances = comfyInstances.filter((_, i) => i !== index);
+    comfyStatus = {};
     renderComfyInstances();
 }
 async function saveComfyInstances(){
@@ -249,6 +357,7 @@ async function saveComfyInstances(){
         const data = await res.json();
         comfyInstances = data.instances || cleaned;
         renderComfyInstances();
+        checkComfyInstances(false);
         try { new BroadcastChannel('studio-api').postMessage({ type: 'comfy-instances-changed' }); } catch(e) {}
         try { window.parent?.postMessage({ type: 'comfy-instances-changed' }, '*'); } catch(e) {}
         setStatus('ComfyUI 后端地址已保存');

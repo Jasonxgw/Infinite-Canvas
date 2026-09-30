@@ -1,1 +1,39 @@
+# 运行环境（自带 python，不入库）
 /python/
+__pycache__/
+*.py[cod]
+.venv/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+
+# 素材库与生成产物（体积大）
+assets/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.m4v
+*.avi
+*.flv
+*.wav
+
+# 密钥与个人配置
+API/.env
+data/api_providers.json
+
+# 运行日志与临时文件
+debug.log
+history.json
+*.bak
+*.bak-*
+data/*.backup-*.json
+
+# 用户数据（分镜工程 / 画布 / 预览缓存）
+data/canvases/
+data/media_previews/
+data/script_projects.json
+data/script_storyboards.json

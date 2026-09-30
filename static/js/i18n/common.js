@@ -30,6 +30,7 @@
         "nav.online": { zh: "在线生图", en: "Online Image" },
         "nav.gpt": { zh: "GPT 对话", en: "GPT Chat" },
         "nav.canvas": { zh: "无限画布", en: "Infinite Canvas" },
+        "nav.scriptStudio": { zh: "剧本分镜", en: "Script Studio" },
         "nav.assetManager": { zh: "素材库", en: "Assets" },
         "nav.runtimeLogs": { zh: "运行日志", en: "Runtime Logs" },
         "bulk.manage": { zh: "管理", en: "Manage" },

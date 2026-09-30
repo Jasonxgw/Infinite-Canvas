@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="/static/images/logo.png" type="image/png">
+    <title>Script Studio | 剧本分镜</title>
+    <script>
+        (function(){
+            try {
+                var theme = localStorage.getItem('studio_theme') || localStorage.getItem('canvas_theme') || 'light';
+                if(theme === 'dark') {
+                    document.documentElement.classList.add('studio-theme-dark');
+                    document.documentElement.classList.add('theme-dark');
+                }
+            } catch(e) {}
+        })();
+    </script>
+    <script src="/static/js/theme.js?v=2026.08.28.1789174829"></script>
+    <script src="/static/js/i18n.js?v=2026.08.28.1790353657"></script>
+    <style>
+        :root {
+            --accent: #111827;
+            --bg: #f9fafb;
+            --card: #ffffff;
+            --border: #e5e7eb;
+            --muted: #6b7280;
+            --soft: #f3f4f6;
+            --easing: cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        html.studio-theme-dark {
+            --accent: #e8e8ea;
+            --bg: #08090c;
+            --card: #111216;
+            --border: #25262b;
+            --muted: #8f9aab;
+            --soft: #17181d;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: var(--accent);
+            font-family: 'Inter', -apple-system, "Segoe UI", sans-serif;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .page {
+            max-width: 1680px;
+            margin: 0 auto;
+            padding: 28px 32px 48px;
+        }
+
+        .page-head { margin-bottom: 22px; }
+
+        .page-head h1 {
+            margin: 0 0 6px;
+            font-size: 22px;
+            font-weight: 700;
+            letter-spacing: .01em;
+        }
+
+        .page-head p {
+            margin: 0;
+            font-size: 13px;
+            color: var(--muted);
+        }
+
+        /* 剧本切换条：同时管好几个剧本，在这切 */
+        .script-bar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 12px;
+        }
+
+        .script-bar-label { font-size: 12.5px; font-weight: 600; }
+
+        .script-bar select {
+            width: auto;
+            min-width: 220px;
+            max-width: 420px;
+        }
+
+        .script-bar-hint { font-size: 11.5px; color: var(--muted); }
+        .script-bar-hint.fail { color: #dc2626; }
+
+        .btn-mini { padding: 5px 10px; font-size: 12px; }
+
+        .layout {
+            display: grid;
+            grid-template-columns: minmax(360px, 440px) minmax(0, 1fr);
+            gap: 22px;
+            align-items: start;
+        }
+
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 16px 16px 18px;
+            margin-bottom: 16px;
+        }
+
+        .card-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            font-size: 13px;
+            font-weight: 700;
+            margin-bottom: 12px;
+        }
+
+        .card-title .hint { font-size: 11px; font-weight: 500; color: var(--muted); }
+
+        .drop {
+            border: 1px dashed var(--border);
+            border-radius: 10px;
+            padding: 18px 14px;
+            text-align: center;
+            font-size: 12px;
+            color: var(--muted);
+            cursor: pointer;
+            transition: all .25s var(--easing);
+            background: var(--soft);
+        }
+
+        .drop:hover, .drop.over { border-color: var(--accent); background: var(--card); color: var(--accent); }
+
+        textarea, input[type="text"], input[type="number"], select {
+            width: 100%;
+            border: 1px solid var(--border);
+            border-radius: 9px;
+            background: var(--card);
+            color: var(--accent);
+            padding: 9px 10px;
+            font-size: 12.5px;
+            font-family: inherit;
+            outline: none;
+            transition: border-color .2s var(--easing);
+        }
+
+        textarea:focus, input:focus, select:focus { border-color: var(--accent); }
+
+        textarea { resize: vertical; line-height: 1.6; }
+
+        #scriptText { min-height: 150px; margin-top: 10px; }
+        #scriptNotes { min-height: 64px; }
+        #castResult { min-height: 150px; }
+        .btn:disabled { opacity: .5; cursor: not-allowed; }
+        #templateText { min-height: 220px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+
+        .row { display: flex; gap: 8px; align-items: center; }
+        .row + .row { margin-top: 10px; }
+        .field { flex: 1; min-width: 0; }
+        .field-label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+
+        .btn {
+            border: 1px solid var(--border);
+            background: var(--card);
+            color: var(--accent);
+            border-radius: 9px;
+            padding: 8px 13px;
+            font-size: 12.5px;
+            font-family: inherit;
+            cursor: pointer;
+            transition: all .22s var(--easing);
+            white-space: nowrap;
+        }
+
+        .btn:hover { border-color: var(--accent); transform: translateY(-1px); }
+        .btn:active { transform: scale(.98); }
+        .btn[disabled] { opacity: .45; cursor: not-allowed; transform: none; }
+
+        .btn-primary { background: #111827; border-color: #111827; color: #fff; }
+        html.studio-theme-dark .btn-primary { background: #e8e8ea; border-color: #e8e8ea; color: #111216; }
+        .btn-primary:hover { background: #000; border-color: #000; }
+        html.studio-theme-dark .btn-primary:hover { background: #fff; border-color: #fff; }
+
+        .btn-block { width: 100%; justify-content: center; display: flex; padding: 11px; font-weight: 600; }
+        /* .btn-block 的 display 会盖掉浏览器默认的 [hidden]{display:none}，这里补回来 */
+        .btn[hidden] { display: none; }
+
+        .muted { color: var(--muted); font-size: 12px; }
+        .empty-hint {
+            border: 1px dashed var(--border);
+            border-radius: 12px;
+            padding: 42px 20px;
+            text-align: center;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .results-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-bottom: 14px;
+        }
+
+        .results-head .status { font-size: 12.5px; color: var(--muted); }
+        .toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+
+        .episode-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 14px 16px 16px;
+            margin-bottom: 14px;
+        }
+
+        .episode-card.state-error { border-color: #f0a4a4; }
+        html.studio-theme-dark .episode-card.state-error { border-color: #6b2b2b; }
+
+        .episode-card-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .episode-card-head h2 { margin: 0; font-size: 15px; font-weight: 700; }
+        .episode-card-head .meta { font-size: 11.5px; color: var(--muted); }
+
+        .badge {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 2px 9px;
+            font-size: 10.5px;
+            border: 1px solid var(--border);
+            color: var(--muted);
+        }
+
+        .badge.running { color: #1d4ed8; border-color: #93b4f5; }
+        .badge.done { color: #15803d; border-color: #86c79b; }
+        .badge.paused { color: #b45309; border-color: #e5b877; }
+        .badge.error { color: #b91c1c; border-color: #f0a4a4; }
+
+        .outline {
+            margin: 12px 0 4px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px 12px;
+            background: var(--soft);
+            font-size: 12px;
+            white-space: pre-wrap;
+            line-height: 1.65;
+            color: var(--muted);
+        }
+
+        .outline summary { cursor: pointer; font-weight: 600; color: var(--accent); font-size: 12.5px; }
+
+        /* 单元排成网格并给提示词限高，让整块和上面的人物卡片大小相当 */
+        .unit-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 12px;
+            margin-top: 10px;
+        }
+
+        /* 分镜一页 20 个，页码条摆在网格下面 */
+        .unit-pager {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .unit-pager .muted { margin-left: 2px; }
+        .btn-mini { padding: 5px 10px; font-size: 12px; }
+        .btn[disabled] { opacity: .45; cursor: not-allowed; }
+
+        .unit {
+            border: 1px solid var(--border);
+            border-radius: 11px;
+            overflow: hidden;
+        }
+
+        /* 分镜里提到的人物 / 场景 → 关联到上面已生成的本地素材缩略图 */
+        .unit-refs {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 6px;
+            padding: 8px 10px 0;
+        }
+        .unit-refs .ref-label { color: var(--muted); font-size: 11.5px; }
+        .unit-ref {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 2px 8px 2px 3px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            background: var(--card);
+            color: var(--accent);
+            font-size: 11.5px;
+            text-decoration: none;
+        }
+        .unit-ref:hover { border-color: var(--accent); }
+        .unit-ref .ref-thumb {
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            overflow: hidden;
+            background: var(--soft);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex: none;
+        }
+        .unit-ref .ref-thumb img { width: 100%; height: 100%; object-fit: cover; }
+        .unit-ref .ref-name { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .unit-ref.ref-idle { color: var(--muted); }
+        .unit-ref .ref-tag { font-size: 10.5px; opacity: .85; }
+
+        .unit-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 8px;
+            padding: 8px 10px;
+            background: var(--soft);
+        }
+
+        .unit-head .title { font-size: 12.5px; font-weight: 700; }
+        .unit-head .sub {
+            display: block;
+            margin-top: 2px;
+            font-size: 11px;
+            color: var(--muted);
+            font-weight: 500;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .check { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); cursor: pointer; }
+        .check input { width: auto; margin: 0; }
+
+        .unit-run {
+            border-top: 1px solid var(--border);
+            padding: 8px 10px;
+            font-size: 11.5px;
+            color: var(--muted);
+        }
+
+        .unit-run.failed { color: #b91c1c; white-space: pre-wrap; word-break: break-word; }
+        html.studio-theme-dark .unit-run.failed { color: #f08a8a; }
+
+        /* 分镜卡片上的成片：出过片的直接摆出来，限高压住高度 */
+        .unit-run-media {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .unit-run-media video, .unit-run-media audio, .unit-run-media img {
+            display: block;
+            width: 100%;
+            max-width: 100%;
+            max-height: 190px;
+            border-radius: 8px;
+            background: var(--soft);
+        }
+        .unit-run-media audio { border: none; }
+
+        /* 每台 ComfyUI 主机：一盏连通性的灯 + 主机名 + 它在跑哪几个分镜 + 队列情况 */
+        .run-hosts { display: grid; gap: 4px; margin-bottom: 10px; }
+        .run-hosts:empty { display: none; }
+        .run-hosts-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            font-size: 11.5px;
+            color: var(--muted);
+        }
+        .run-hosts-check {
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 1px 8px;
+            background: var(--card);
+            color: var(--accent);
+            font-size: 11px;
+            cursor: pointer;
+        }
+        .run-hosts-check:hover { border-color: var(--accent); }
+        .run-host { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--muted); }
+        .host-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+        .host-dot.ok { background: #16a34a; }
+        .host-dot.fail { background: #dc2626; }
+        .host-dot.checking { background: #d97706; }
+        .run-host-name { flex: 0 0 auto; font-weight: 500; color: var(--accent); }
+        .run-host-units { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .host-tail { flex: 0 0 auto; }
+        .host-tail.ok { color: #16a34a; }
+        .host-tail.fail { color: #dc2626; }
+
+        /* 本机保存过的分镜提示词清单：一行一份，右边是加载 / 删除 */
+        .sb-lib {
+            display: grid;
+            gap: 8px;
+            margin-bottom: 10px;
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: var(--soft);
+            max-height: 260px;
+            overflow: auto;
+        }
+        .sb-row { display: flex; align-items: center; gap: 12px; justify-content: space-between; }
+        .sb-meta { min-width: 0; }
+        .sb-name { font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .sb-meta .muted { font-size: 11.5px; }
+
+        /* 对话补分镜：左侧对话记录，右侧输入区 */
+        .chat-panel[hidden] { display: none; }
+        .chat-panel {
+            display: grid;
+            gap: 10px;
+            margin-bottom: 10px;
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: var(--soft);
+        }
+        .chat-log {
+            display: grid;
+            gap: 10px;
+            max-height: 340px;
+            overflow: auto;
+            padding-right: 4px;
+        }
+        .chat-msg { display: grid; gap: 4px; }
+        .chat-who { font-size: 11.5px; color: var(--muted); }
+        .chat-text { font-size: 12.5px; white-space: pre-wrap; word-break: break-word; }
+        .chat-me .chat-text {
+            padding: 8px 10px;
+            border-radius: 8px;
+            background: var(--panel);
+            border: 1px solid var(--border);
+        }
+        .chat-units { display: grid; gap: 8px; }
+        .chat-unit {
+            padding: 8px 10px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--panel);
+        }
+        .chat-unit-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+        .chat-unit-head .title { font-size: 12.5px; font-weight: 600; }
+        .chat-unit-head .sub { font-size: 11.5px; color: var(--muted); }
+        .chat-unit pre {
+            margin: 0;
+            font-size: 11.5px;
+            max-height: 180px;
+            overflow: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .chat-draft-hint { font-size: 11.5px; }
+        .chat-input-row { display: flex; gap: 8px; align-items: flex-end; }
+        .chat-input-row textarea { flex: 1; min-height: 56px; }
+
+        /* 同一分镜的历次成片：版本条负责切换，对比把每一版摊开一起看 */
+        .unit-versions {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 6px;
+            margin-top: 8px;
+        }
+        .unit-versions-count { font-size: 11px; color: var(--muted); }
+        .version-chip {
+            font-family: inherit;
+            font-size: 11px;
+            line-height: 1;
+            padding: 5px 9px;
+            border-radius: 999px;
+            border: 1px solid var(--border);
+            background: var(--soft);
+            color: var(--muted);
+            cursor: pointer;
+            transition: border-color .16s var(--easing), color .16s var(--easing), transform .16s var(--easing);
+        }
+        .version-chip:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
+        .version-chip.active { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+        .version-chip.failed { border-style: dashed; }
+        .version-chip.compare { margin-left: auto; }
+
+        .unit-compare {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .unit-compare-item { border: 1px solid var(--border); border-radius: 9px; padding: 6px; background: var(--soft); }
+        .unit-compare-item.active { border-color: var(--accent); }
+        .unit-compare-label { font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+        .unit-compare-item video, .unit-compare-item img, .unit-compare-item audio {
+            display: block;
+            width: 100%;
+            max-width: 100%;
+            max-height: 150px;
+            border-radius: 9px;
+            border: 1px solid var(--border);
+            background: var(--soft);
+        }
+        .unit-compare-item audio { border: none; }
+        .unit-compare-note { font-size: 11px; color: var(--muted); word-break: break-word; }
+        .unit-compare-note.failed { color: #b91c1c; }
+        html.studio-theme-dark .unit-compare-note.failed { color: #f08a8a; }
+
+        .unit pre {
+            margin: 0;
+            padding: 9px 10px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 11px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 112px;
+            overflow: auto;
+        }
+
+        select.mini { width: auto; padding: 6px 8px; font-size: 12px; }
+
+        .cast-group { margin-bottom: 16px; }
+
+        .cast-group-title {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            width: 100%;
+            margin: 0 0 9px;
+            padding: 0;
+            border: 0;
+            background: none;
+            color: var(--accent);
+            font-family: inherit;
+            font-size: 12.5px;
+            font-weight: 700;
+            text-align: left;
+            cursor: pointer;
+        }
+
+        .cast-group-title:hover { color: var(--muted); }
+        .cast-caret { font-size: 10px; color: var(--muted); }
+        .cast-group-title .hint { margin-left: auto; font-size: 11px; font-weight: 500; color: var(--muted); }
+        .cast-group.collapsed .cast-group-title { margin-bottom: 0; }
+
+        .cast-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+
+        .cast-item {
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            background: var(--card);
+            padding: 10px 12px 12px;
+        }
+
+        .cast-item-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .cast-item-head .title {
+            font-size: 12.5px;
+            font-weight: 600;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .cast-item pre {
+            margin: 0 0 9px;
+            padding: 8px 9px;
+            border-radius: 8px;
+            background: var(--soft);
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 11px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 112px;
+            overflow: auto;
+        }
+
+        .cast-shot { border: 1px solid var(--border); border-radius: 9px; overflow: hidden; background: var(--soft); }
+        .cast-shot img { display: block; width: 100%; height: auto; }
+        .cast-shot .placeholder { padding: 26px 12px; text-align: center; font-size: 11.5px; color: var(--muted); }
+        .cast-shot .placeholder.failed { color: #b91c1c; white-space: pre-wrap; word-break: break-word; }
+        html.studio-theme-dark .cast-shot .placeholder.failed { color: #f08a8a; }
+
+        .raw-block { margin-top: 10px; }
+        .raw-block pre {
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: var(--soft);
+            padding: 12px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 11.5px;
+            line-height: 1.7;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 360px;
+            overflow: auto;
+            margin: 8px 0 0;
+        }
+
+        .error-text {
+            margin-top: 10px;
+            font-size: 12.5px;
+            color: #b91c1c;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        html.studio-theme-dark .error-text { color: #f08a8a; }
+
+        .warn-text {
+            margin-top: 10px;
+            font-size: 12.5px;
+            color: #b45309;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        html.studio-theme-dark .warn-text { color: #f0c07a; }
+
+        .toast {
+            position: fixed;
+            left: 50%;
+            bottom: 28px;
+            transform: translateX(-50%) translateY(14px);
+            background: #111827;
+            color: #fff;
+            border-radius: 10px;
+            padding: 10px 16px;
+            font-size: 12.5px;
+            opacity: 0;
+            pointer-events: none;
+            transition: all .28s var(--easing);
+            z-index: 99;
+        }
+
+        html.studio-theme-dark .toast { background: #e8e8ea; color: #111216; }
+        .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+        @media (max-width: 1080px) {
+            .layout { grid-template-columns: minmax(0, 1fr); }
+            .page { padding: 20px 16px 40px; }
+        }
+    </style>
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.28.1789174829">
+</head>
+
+<body>
+    <div class="page">
+        <div class="page-head">
+            <h1 data-i18n="script.title">剧本分镜</h1>
+            <p data-i18n="script.subtitle">上传剧本 → 选择默认提示词 → 生成 ComfyUI 提示词</p>
+            <div class="script-bar">
+                <span class="script-bar-label" data-i18n="script.projLabel">剧本</span>
+                <select id="scriptProjectSelect"></select>
+                <button class="btn btn-mini" id="newScriptBtn" data-i18n="script.projNew">新建</button>
+                <button class="btn btn-mini" id="renameScriptBtn" data-i18n="script.projRename">重命名</button>
+                <button class="btn btn-mini" id="deleteScriptBtn" data-i18n="script.projDelete">删除</button>
+                <span class="script-bar-hint" id="scriptProjectSaved"></span>
+            </div>
+        </div>
+
+        <div class="layout">
+            <!-- 左：三步配置 -->
+            <div>
+                <div class="card">
+                    <div class="card-title">
+                        <span data-i18n="script.stepUpload">1 · 上传剧本</span>
+                        <span class="hint" id="scriptSummary"></span>
+                    </div>
+
+                    <div class="drop" id="dropZone" data-i18n="script.dropHint">拖拽 .txt / .md 文件到此处，或点击选择文件</div>
+                    <input type="file" id="fileInput" accept=".txt,.md,.markdown,.text" hidden>
+
+                    <label class="field-label" style="margin-top:12px" data-i18n="script.pasteLabel">或直接粘贴剧本正文</label>
+                    <textarea id="scriptText" data-i18n-placeholder="script.pastePlaceholder"></textarea>
+
+                    <div class="row" style="margin-top:10px">
+                        <button class="btn" id="clearBtn" data-i18n="script.clear">清空</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title"><span data-i18n="script.stepCast">2 · 生成人物、场景与道具</span></div>
+                    <label class="field-label" data-i18n="script.castTemplate">提取模板</label>
+                    <select id="castTemplateSelect"></select>
+                    <div class="muted" id="castTemplateHint" style="margin-top:8px" data-i18n="script.castTemplateHint">按这份模板从剧本里提取人物三视图、场景图与道具图提示词；结果会作为固定设定，带入下一步的分镜提示词。</div>
+                    <div class="row" style="margin-top:12px">
+                        <button class="btn btn-primary" id="castGenerateBtn" data-i18n="script.castGenerate">生成人物、场景与道具</button>
+                        <button class="btn" id="castPropGenerateBtn" data-i18n="script.castPropGenerate" data-i18n-title="script.castPropGenerateHint" title="只提取道具，人物与场景的提示词和已生成的参考图都不动">只提取道具</button>
+                        <button class="btn" id="castStopBtn" hidden data-i18n="script.stop">停止</button>
+                    </div>
+                    <div class="muted" id="castStatus" style="margin-top:8px"></div>
+                    <label class="field-label" style="margin-top:12px" data-i18n="script.characterPrompts">人物提示词（可编辑）</label>
+                    <textarea id="castCharacters" data-i18n-placeholder="script.charactersPlaceholder"></textarea>
+                    <label class="field-label" style="margin-top:12px" data-i18n="script.scenePrompts">场景提示词（可编辑）</label>
+                    <textarea id="castScenes" data-i18n-placeholder="script.scenesPlaceholder"></textarea>
+                    <label class="field-label" style="margin-top:12px" data-i18n="script.propPrompts">道具提示词（可编辑）</label>
+                    <textarea id="castProps" data-i18n-placeholder="script.propsPlaceholder"></textarea>
+                    <div class="row" style="margin-top:8px">
+                        <button class="btn" id="castCopyBtn" data-i18n="script.copy">复制</button>
+                        <button class="btn" id="castDownloadBtn" data-i18n="script.download">下载</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">
+                        <span data-i18n="script.stepTemplate">3 · 选择默认提示词</span>
+                        <button class="btn" id="toggleTemplateBtn" data-i18n="script.editTemplate">查看 / 编辑</button>
+                    </div>
+                    <select id="templateSelect"></select>
+                    <div class="muted" id="templateHint" style="margin-top:8px" data-i18n="script.templateHint">这份提示词会作为系统提示词发送，决定分镜规则与输出格式。</div>
+                    <div class="row" style="margin-top:10px">
+                        <button class="btn" id="uploadTemplateBtn" data-i18n="script.uploadTemplate">上传提示词</button>
+                        <input type="file" id="templateFileInput" accept=".txt,.md,.markdown,.text" hidden>
+                        <div class="field">
+                            <input type="text" id="templateNameInput" data-i18n-placeholder="script.templateNamePlaceholder" placeholder="提示词名称">
+                        </div>
+                        <button class="btn btn-primary" id="saveTemplateBtn" data-i18n="script.saveTemplate">存为常用</button>
+                    </div>
+                    <div id="templateEditor" hidden style="margin-top:10px">
+                        <textarea id="templateText"></textarea>
+                        <div class="row" style="margin-top:8px">
+                            <button class="btn" id="resetTemplateBtn" data-i18n="script.templateReset">还原为选中版本</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title"><span data-i18n="script.stepSettings">4 · 生成设置</span></div>
+                    <div class="row">
+                        <div class="field">
+                            <label class="field-label" data-i18n="script.provider">API 平台</label>
+                            <select id="providerSelect"></select>
+                        </div>
+                        <div class="field">
+                            <label class="field-label" data-i18n="script.model">模型</label>
+                            <select id="modelSelect"></select>
+                        </div>
+                    </div>
+                    <div class="muted" data-i18n="script.unitAutoNote" style="margin-bottom:10px">分镜数量由剧本内容自动决定，按每个单元 10–15 秒的容量切分。</div>
+                    <label class="check" style="margin-bottom:14px">
+                        <input type="checkbox" id="allowRewriteInput">
+                        <span data-i18n="script.allowRewrite">允许压缩改写台词</span>
+                    </label>
+                    <div class="row" style="display:block">
+                        <label class="field-label" data-i18n="script.notes">补充要求（可选）</label>
+                        <textarea id="scriptNotes" data-i18n-placeholder="script.notesPlaceholder"></textarea>
+                    </div>
+                    <div class="row" style="margin-top:12px">
+                        <button class="btn btn-primary btn-block" id="generateBtn" data-i18n="script.generate">开始生成分镜提示词</button>
+                    </div>
+                    <div class="row">
+                        <button class="btn btn-block" id="stopBtn" hidden data-i18n="script.stop">停止</button>
+                    </div>
+                    <div class="muted" id="generateHint" style="margin-top:8px" data-i18n="script.generateNeedCast">请先在「2 · 生成人物与场景」里生成人物与场景提示词，分镜会沿用这份设定。</div>
+                </div>
+            </div>
+
+            <!-- 右：结果 -->
+            <div>
+                <div class="results-head">
+                    <span class="status" id="castGalleryTitle" data-i18n="script.castGallery">人物与场景参考图</span>
+                    <div class="toolbar">
+                        <select class="mini" id="castImageEngineSelect"></select>
+                        <select class="mini" id="imageProviderSelect"></select>
+                        <select class="mini" id="imageModelSelect"></select>
+                        <select class="mini" id="imageRatioSelect"></select>
+                        <select class="mini" id="imageResolutionSelect"></select>
+                        <select class="mini" id="castComfyWorkflowSelect" hidden></select>
+                        <button class="btn btn-primary" id="castCharacterAllBtn" data-i18n="script.imageGenAllCharacters">人物全部生成</button>
+                        <button class="btn btn-primary" id="castSceneAllBtn" data-i18n="script.imageGenAllScenes">场景全部生成</button>
+                        <button class="btn btn-primary" id="castPropAllBtn" data-i18n="script.imageGenAllProps">道具全部生成</button>
+                        <button class="btn" id="castImageStopBtn" hidden data-i18n="script.stop">停止</button>
+                    </div>
+                </div>
+                <div class="muted" id="castImageStatus" style="margin-bottom:10px"></div>
+                <div id="castGallery"></div>
+
+                <div class="results-head" style="margin-top:22px">
+                    <span class="status" id="resultStatus"></span>
+                    <div class="toolbar">
+                        <select class="mini" id="comfyWorkflowSelect" data-i18n-title="script.comfyWorkflow" title="工作流"></select>
+                        <button class="btn btn-primary" id="runAllUnitsBtn" data-i18n="script.comfyRunAll" data-i18n-title="script.comfyRunAllHint" title="生成全部分镜">生成全部分镜</button>
+                        <button class="btn" id="stopAllUnitsBtn" hidden data-i18n="script.stop">停止</button>
+                        <button class="btn" id="copyAllBtn" data-i18n="script.copyAll">复制全部</button>
+                        <button class="btn" id="exportMdBtn" data-i18n="script.exportMd">导出 Markdown</button>
+                        <button class="btn" id="exportJsonBtn" data-i18n="script.exportJson">导出 JSON</button>
+                        <button class="btn" id="saveLibraryBtn" data-i18n="script.saveToLibrary">存入提示词库</button>
+                        <button class="btn" id="importStoryboardBtn" data-i18n="script.sbImport" data-i18n-title="script.sbImportHint" title="从 JSON 文件导入分镜提示词">导入分镜</button>
+                        <button class="btn" id="loadLibraryUnitsBtn" data-i18n="script.sbFromLibrary" data-i18n-title="script.sbFromLibraryHint" title="把提示词库里 P 开头的单元提示词整批加载为当前分镜">从提示词库加载</button>
+                        <button class="btn" id="chatStoryboardBtn" data-i18n="script.chatOpen" data-i18n-title="script.chatOpenHint" title="跟模型对话，补写新的分镜提示词，再插到指定位置">对话加分镜</button>
+                        <button class="btn" id="saveStoryboardBtn" data-i18n="script.sbSave" data-i18n-title="script.sbSaveHint" title="保存分镜提示词到本机">保存分镜</button>
+                        <button class="btn" id="openStoryboardBtn" data-i18n="script.sbOpen" data-i18n-title="script.sbOpenHint" title="从本机加载已保存的分镜提示词">加载分镜</button>
+                        <input type="file" id="importStoryboardInput" accept=".json,application/json" hidden>
+                    </div>
+                </div>
+                <div id="storyboardLib" class="sb-lib" hidden></div>
+
+                <div id="storyboardChat" class="chat-panel" hidden>
+                    <div class="results-head" style="margin:0">
+                        <span class="status" data-i18n="script.chatTitle">对话加分镜</span>
+                        <div class="toolbar">
+                            <span class="muted" id="chatStatus"></span>
+                            <button class="btn" id="chatStopBtn" hidden data-i18n="script.stop">停止</button>
+                            <button class="btn" id="chatClearBtn" data-i18n="script.chatClear">清空对话</button>
+                        </div>
+                    </div>
+                    <div class="muted" data-i18n="script.chatHint">描述你想要的镜头（比如「补一段江砚上车前的镜头，放在 P01 前面」），模型只输出新增的分镜提示词；确认后再点分镜卡片上的「插入到此处」。</div>
+                    <div class="chat-log" id="chatLog"></div>
+                    <div class="chat-input-row">
+                        <textarea id="chatInput" data-i18n-placeholder="script.chatPlaceholder" placeholder="说说要补什么分镜…（Enter 发送，Shift+Enter 换行）"></textarea>
+                        <button class="btn btn-primary" id="chatSendBtn" data-i18n="script.chatSend">发送</button>
+                    </div>
+                </div>
+
+                <div class="muted" id="unitsRunStatus" style="margin-bottom:10px"></div>
+                <div id="unitsRunHosts" class="run-hosts"></div>
+                <div id="results"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script src="/static/js/script-studio.js?v=2026.08.28.1790666769"></script>
+</body>
+
+</html>

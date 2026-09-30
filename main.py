@@ -27,8 +27,9 @@ import shlex
 import functools
 import html
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Tuple
-from threading import Lock, Thread
+from threading import Lock, Thread, Event, local
 from collections import deque
 import httpx
 from PIL import Image, ImageOps
@@ -339,6 +340,13 @@ CANVAS_DIR = os.path.join(DATA_DIR, "canvases")
 MEDIA_PREVIEW_DIR = os.path.join(DATA_DIR, "media_previews")
 ASSET_LIBRARY_PATH = os.path.join(DATA_DIR, "asset_library.json")
 PROMPT_LIBRARY_PATH = os.path.join(DATA_DIR, "prompt_libraries.json")
+# 分镜页提示词存在分镜页自己的文件里：单位是「一份分镜」，不是一条条提示词，
+# 所以不和提示词库（prompt_libraries.json）混在一起
+SCRIPT_STORYBOARD_PATH = os.path.join(DATA_DIR, "script_storyboards.json")
+# 剧本库：浏览器那份 localStorage 只装得下一个剧本（几 MB 就顶格），要同时管几个剧本
+# 得放到本机文件里。一份剧本 = 正文 + 人物与场景（含参考图）+ 分镜提示词 + 断点，
+# 切换剧本等于换一整套工作区，各存各的进度
+SCRIPT_PROJECT_PATH = os.path.join(DATA_DIR, "script_projects.json")
 API_PROVIDERS_FILE = os.path.join(DATA_DIR, "api_providers.json")
 RUNNINGHUB_WORKFLOW_STORE_FILE = os.path.join(DATA_DIR, "runninghub_workflows.json")
 SHARED_FOLDERS_FILE = os.path.join(DATA_DIR, "shared_folders.json")
@@ -639,6 +647,57 @@ load_env_file()
 COMFYUI_INSTANCES = [s.strip() for s in os.getenv("COMFYUI_INSTANCES", "127.0.0.1:8188").split(",") if s.strip()]
 COMFYUI_ADDRESS = COMFYUI_INSTANCES[0]
 
+# 后端地址有两种形态：自建直连是 host:port（走 http），
+# 智算 WaaS 实例只给一个域名、ComfyUI 就挂在它根路径上（走 https 443，
+# 例如 200f9a378f9b418bb781d3b6d74dd8b9.region1.waas.aigate.cc）。
+# 拼 URL 一律走下面两个函数，别再用 f"http://{addr}" 硬拼。
+COMFY_ADDR_SCHEME_RE = re.compile(r"^(https?)://", re.I)
+COMFY_BARE_IP_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+
+def comfy_base_url(addr: str) -> str:
+    """把后端地址补成完整 URL；已经是完整 URL 的原样返回，老 .env 里的 host:port 也认。"""
+    s = str(addr or "").strip().rstrip("/")
+    if not s:
+        return ""
+    if COMFY_ADDR_SCHEME_RE.match(s):
+        return s
+    host, sep, port = s.rpartition(":")
+    if sep and port.isdigit():
+        return f"http://{host}:{port}"
+    # 不带端口：域名按 https，裸 IP / localhost 退回 http
+    if COMFY_BARE_IP_RE.match(s) or s.lower() == "localhost":
+        return f"http://{s}"
+    return f"https://{s}"
+
+def comfy_ws_url(addr: str) -> str:
+    """WebSocket 地址要跟着 http/https 换成 ws/wss，否则 https 实例上握手会被拒。"""
+    base = comfy_base_url(addr)
+    if base.startswith("https://"):
+        return "wss://" + base[len("https://"):]
+    if base.startswith("http://"):
+        return "ws://" + base[len("http://"):]
+    return base
+
+def normalize_comfy_instance(raw: str) -> str:
+    """把用户填的后端地址规整成完整 URL 存下来；非法（空、带路径、带空格、端口不对）返回空串。"""
+    s = str(raw or "").strip().rstrip("/")
+    if not s:
+        return ""
+    scheme = ""
+    m = COMFY_ADDR_SCHEME_RE.match(s)
+    if m:
+        scheme = m.group(0).lower()
+        s = s[m.end():]
+    # 地址中间夹了空格（粘贴时常见）拼出来的 URL 根本发不出去，早点判非法
+    if not s or "/" in s or any(ch.isspace() for ch in s):
+        return ""
+    host, sep, port = s.rpartition(":")
+    if sep and (not host or not port.isdigit() or not 0 < int(port) <= 65535):
+        return ""
+    if scheme:
+        return f"{scheme}{s}"
+    return comfy_base_url(s)
+
 AI_BASE_URL = os.getenv("COMFLY_BASE_URL", "https://ai.comfly.chat").rstrip("/")
 AI_API_KEY = os.getenv("COMFLY_API_KEY", "")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
@@ -703,6 +762,12 @@ COMFYUI_SUBMIT_ATTEMPTS = int(float(os.getenv("COMFYUI_SUBMIT_ATTEMPTS", "4")))
 COMFYUI_SUBMIT_TIMEOUT = float(os.getenv("COMFYUI_SUBMIT_TIMEOUT", "20"))
 COMFYUI_SUBMIT_RETRY_DELAY = float(os.getenv("COMFYUI_SUBMIT_RETRY_DELAY", "3"))
 COMFYUI_SUBMIT_RETRY_CODES = {408, 425, 429, 500, 502, 503, 504}
+# ComfyUI 是直连的 IP:port 服务，不能跟随系统/环境里的 HTTP 代理：开着 Clash 之类的代理时，
+# 走代理的 POST 会直接失败、大文件上传会读超时，表现为生成时报 “Failed to upload to any backend”。
+COMFYUI_NO_PROXY = {"http": None, "https": None}
+COMFYUI_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# 上传素材到 ComfyUI 的读超时（秒）：视频动辄数十 MB，原来的 5 秒在稍慢的网络下必然失败。
+COMFYUI_UPLOAD_TIMEOUT = float(os.getenv("COMFYUI_UPLOAD_TIMEOUT", "300"))
 APIMART_IMAGE_TASK_TIMEOUT = float(os.getenv("APIMART_IMAGE_TASK_TIMEOUT", "1800"))
 APIMART_IMAGE_POLL_INTERVAL = float(os.getenv("APIMART_IMAGE_POLL_INTERVAL", "5"))
 APIMART_IMAGE_INITIAL_POLL_DELAY = float(os.getenv("APIMART_IMAGE_INITIAL_POLL_DELAY", "10"))
@@ -816,6 +881,8 @@ def provider_key_env(provider_id):
         return "RUNNINGHUB_API_KEY"
     if provider_id == "volcengine":
         return "ARK_API_KEY"
+    if provider_id == "deepseek":
+        return "DEEPSEEK_API_KEY"
     return f"API_PROVIDER_{re.sub(r'[^A-Za-z0-9]', '_', provider_id).upper()}_KEY"
 
 def runninghub_wallet_key_env():
@@ -1665,9 +1732,34 @@ os.makedirs(WORKFLOW_DIR, exist_ok=True)
 os.makedirs(CONVERSATION_DIR, exist_ok=True)
 os.makedirs(CANVAS_DIR, exist_ok=True)
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+class RevalidatingStaticFiles(StaticFiles):
+    """前端静态资源每次回服务器确认一次。
+
+    浏览器默认按 Last-Modified 做启发式缓存，改了 JS 之后照样用旧文件，
+    页面就会出现「明明改过却没生效」的假象（要手动 Ctrl+F5 才行）。
+    加上 no-cache 后每次都会带 If-Modified-Since 来问一句，没改就是 304，很快。
+    """
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code < 400:
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
+
+app.mount("/static", RevalidatingStaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
 app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
+
+
+@app.middleware("http")
+async def protect_script_config_in_assets(request: Request, call_next):
+    """剧本文件夹里放的 api_providers.json 是配置副本（含 API Key），不许从 /assets 静态路径读走。"""
+    path = urllib.parse.unquote(request.url.path or "")
+    if path.startswith("/assets/") and path.lower().split("?")[0].endswith("api_providers.json"):
+        return Response(status_code=404)
+    return await call_next(request)
+
 
 # --- Pydantic 模型 ---
 
@@ -1847,6 +1939,15 @@ def static_html_response(filename: str):
 
 STATIC_PROMPT_TEMPLATE_MD = os.path.join(STATIC_DIR, "system-prompts", "infinite-canvas-prompt-templates.md")
 PROMPT_TEMPLATE_PATHS = [STATIC_PROMPT_TEMPLATE_MD]
+# 剧本分镜用的「默认提示词」目录：每个 .md/.txt 文件是一个可选项
+SCRIPT_PROMPT_TEMPLATE_DIR = os.path.join(STATIC_DIR, "system-prompts", "script")
+# 用户上传并「存为常用」的剧本提示词
+SCRIPT_USER_TEMPLATE_PATH = os.path.join(DATA_DIR, "script_prompt_templates.json")
+# 单次生成的最大输出 token。推理模型（如 deepseek-flash）会先花掉大量思维链 token，
+# 12 个单元的正文约需 6-8k token，再叠加思维链，8k 会被截断成空正文，故默认给到 32k。
+# 长剧本分成多段跑，思维链会随段数累积，所以往上提到上游允许的上限 393216
+# （再高平台直接拒单：the valid range of max_tokens is [1, 393216]）。
+SCRIPT_GENERATE_MAX_TOKENS = int(os.getenv("SCRIPT_GENERATE_MAX_TOKENS", "393216"))
 PROMPT_TEMPLATE_EN = {
     "多机位九宫格": {
         "name": "9-Angle Multi-Camera Grid",
@@ -2866,6 +2967,12 @@ class GenerateRequest(BaseModel):
     type: str = "zimage"
     client_id: str = ""
     convert_to_jpg: bool = False
+    # 运行前是否让远端 ComfyUI 卸载驻留模型并释放显存缓存（POST /free）。
+    # 默认关闭：模型被卸载后这次运行要重新从磁盘加载，能装进显存的工作流会明显变慢。
+    comfy_free_memory: bool = False
+    # 分镜自己写的时长（秒）要落到工作流哪个参数上：前端按名字定位好字段后带过来
+    # （nodes + input），后端在提交前按实际分配到的这张卡的显存夹一次。
+    duration_param: Dict[str, Any] = {}
 
 class DeleteHistoryRequest(BaseModel):
     timestamp: float
@@ -3314,8 +3421,8 @@ def check_images_exist(backend_addr, images):
     if not images: return True
     for img in images:
         try:
-            url = f"http://{backend_addr}/view?filename={urllib.parse.quote(img)}&type=input"
-            r = requests.get(url, stream=True, timeout=0.5)
+            url = f"{comfy_base_url(backend_addr)}/view?filename={urllib.parse.quote(img)}&type=input"
+            r = requests.get(url, stream=True, timeout=0.5, proxies=COMFYUI_NO_PROXY)
             r.close()
             if r.status_code != 200: return False
         except: return False
@@ -3424,7 +3531,7 @@ def get_best_backend(required_images: List[str] = None):
 
     for addr in COMFYUI_INSTANCES:
         try:
-            with urllib.request.urlopen(f"http://{addr}/queue", timeout=1) as response:
+            with COMFYUI_OPENER.open(f"{comfy_base_url(addr)}/queue", timeout=1) as response:
                 data = json.loads(response.read())
                 remote_load = len(data.get('queue_running', [])) + len(data.get('queue_pending', []))
                 with LOAD_LOCK:
@@ -3447,27 +3554,101 @@ def get_best_backend(required_images: List[str] = None):
 
     return best_backend
 
-def reserve_best_backend(required_images: List[str] = None):
-    backend_stats = {}
-    for addr in COMFYUI_INSTANCES:
+# 探一次后端负载（队列长度 + 参考图在不在这台上）。1 秒的短超时对公网上的 WaaS
+# 实例太苛刻，探不通那台就被当作不可用而跳过，任务会全压到剩下唯一一台，
+# 负载均衡等于没生效，所以放到 5 秒。
+COMFY_PROBE_TIMEOUT = 5
+# 公网 WaaS 抖一下就会超时，单次判死等于整批都避开这台（和上面的坑一样），
+# 所以再试一次；两次都探不通才当它不可用。
+COMFY_PROBE_ATTEMPTS = 2
+COMFY_PROBE_RETRY_DELAY = 0.4
+
+def probe_backend_load(addr):
+    """这台机器现在排了多少活；两次都探不通才算不可用，返回 None。"""
+    last_error = None
+    for attempt in range(COMFY_PROBE_ATTEMPTS):
+        if attempt:
+            time.sleep(COMFY_PROBE_RETRY_DELAY)
         try:
-            with urllib.request.urlopen(f"http://{addr}/queue", timeout=1) as response:
+            with COMFYUI_OPENER.open(f"{comfy_base_url(addr)}/queue", timeout=COMFY_PROBE_TIMEOUT) as response:
                 data = json.loads(response.read())
-                remote_load = len(data.get('queue_running', [])) + len(data.get('queue_pending', []))
-                has_images = check_images_exist(addr, required_images)
-                backend_stats[addr] = {"remote_load": remote_load, "has_images": has_images}
+            return len(data.get('queue_running', [])) + len(data.get('queue_pending', []))
         except Exception as e:
-            print(f"Backend {addr} unreachable: {e}")
-            continue
+            last_error = e
+    print(f"Backend {addr} unreachable: {last_error}")
+    return None
+
+def comfy_probe_error_text(error):
+    """探不通的原因说人话，设置页上要直接显示给用户看。"""
+    if isinstance(error, urllib.error.HTTPError):
+        return f"HTTP {error.code}"
+    reason = str(getattr(error, "reason", "") or "").strip()
+    text = (reason or str(error)).strip()
+    lowered = text.lower()
+    if "timed out" in lowered or "timeout" in lowered:
+        return "连接超时"
+    # 10061 是 Windows 本地化过的「目标计算机积极拒绝」，单判 refused 认不出来
+    if "refused" in lowered or "10061" in text:
+        return "连接被拒绝"
+    if "getaddrinfo" in lowered or "name or service not known" in lowered:
+        return "域名解析不了"
+    return text[:160] or error.__class__.__name__
+
+def comfy_queue_snapshot(addr):
+    """这一台连得上没有、队列里排了几个活。设置页拿它画绿点 / 红点。
+
+    只看 /queue：能读回来就算连得上，顺带把「运行中 / 排队中」的条数带出来。
+    """
+    try:
+        with COMFYUI_OPENER.open(f"{comfy_base_url(addr)}/queue", timeout=COMFY_PROBE_TIMEOUT) as response:
+            data = json.loads(response.read())
+        return {
+            "backend": addr,
+            "ok": True,
+            "running": len(data.get("queue_running") or []),
+            "pending": len(data.get("queue_pending") or []),
+            "error": "",
+        }
+    except Exception as e:
+        return {"backend": addr, "ok": False, "running": 0, "pending": 0,
+                "error": comfy_probe_error_text(e)}
+
+# 一样闲的几台之间轮流派。不轮会有两个坑：一是每次都挑中第一台，
+# 「生成全部分镜」这种一个接一个提交的批量会全堆在同一台机器上，另一台一直闲着；
+# 二是旧逻辑还偏向「参考图已经在的那台」，而参考图在加新主机之前只传过第一台，
+# 于是新加的那台永远选不上，白配。参考图缺了会由 generate() 自动从别的主机同步过去。
+ROUND_ROBIN_STATE = {"last": None}
+
+def pick_round_robin(candidates: List[str]) -> str:
+    if len(candidates) == 1:
+        ROUND_ROBIN_STATE["last"] = candidates[0]
+        return candidates[0]
+    last = ROUND_ROBIN_STATE.get("last")
+    chosen = candidates[0]
+    if last in COMFYUI_INSTANCES:
+        tail = COMFYUI_INSTANCES[COMFYUI_INSTANCES.index(last) + 1:]
+        chosen = next((addr for addr in tail if addr in candidates), candidates[0])
+    ROUND_ROBIN_STATE["last"] = chosen
+    return chosen
+
+def reserve_best_backend():
+    # 逐个主机排队探太慢（多台时等于把延迟叠起来），并发探，谁先回来算谁的
+    backend_stats = {}
+    if COMFYUI_INSTANCES:
+        with ThreadPoolExecutor(max_workers=len(COMFYUI_INSTANCES)) as pool:
+            results = pool.map(probe_backend_load, COMFYUI_INSTANCES)
+            for addr, stats in zip(COMFYUI_INSTANCES, results):
+                if stats is not None:
+                    backend_stats[addr] = stats
     with LOAD_LOCK:
-        best_backend = COMFYUI_INSTANCES[0]
-        min_load = float('inf')
-        if backend_stats:
-            for addr, stats in backend_stats.items():
-                load = max(stats["remote_load"], BACKEND_LOCAL_LOAD.get(addr, 0))
-                if load < min_load or (load == min_load and stats.get("has_images") and not backend_stats.get(best_backend, {}).get("has_images")):
-                    min_load = load
-                    best_backend = addr
+        if not backend_stats:
+            # 一台都没探通时也别死盯着第一台：还在轮转着派，免得网络抖动那几分钟
+            # 全堆到同一台上（真探不通的话提交会失败，和挑第一台的结果一样）
+            best_backend = pick_round_robin(list(COMFYUI_INSTANCES) or [COMFYUI_ADDRESS])
+        else:
+            loads = {addr: max(stats, BACKEND_LOCAL_LOAD.get(addr, 0)) for addr, stats in backend_stats.items()}
+            min_load = min(loads.values())
+            best_backend = pick_round_robin([addr for addr in COMFYUI_INSTANCES if loads.get(addr) == min_load])
         BACKEND_LOCAL_LOAD[best_backend] = BACKEND_LOCAL_LOAD.get(best_backend, 0) + 1
         return best_backend
 
@@ -3476,9 +3657,9 @@ def reserve_best_backend(required_images: List[str] = None):
 def download_image(comfy_address, comfy_url_path, prefix="studio_"):
     filename = f"{prefix}{uuid.uuid4().hex[:10]}.png"
     local_path = output_path_for(filename, "output")
-    full_url = f"http://{comfy_address}{comfy_url_path}"
+    full_url = f"{comfy_base_url(comfy_address)}{comfy_url_path}"
     try:
-        with urllib.request.urlopen(full_url, timeout=COMFYUI_DOWNLOAD_TIMEOUT) as response, open(local_path, 'wb') as out_file:
+        with COMFYUI_OPENER.open(full_url, timeout=COMFYUI_DOWNLOAD_TIMEOUT) as response, open(local_path, 'wb') as out_file:
             shutil.copyfileobj(response, out_file)
         return output_url_for(filename, "output")
     except Exception as e:
@@ -3543,9 +3724,9 @@ def download_comfy_output(comfy_address, item, prefix="studio_"):
     subfolder = urllib.parse.quote(str(item.get("subfolder") or ""))
     file_type = urllib.parse.quote(str(item.get("type") or "output"))
     comfy_url_path = f"/view?filename={urllib.parse.quote(str(item['filename']))}&subfolder={subfolder}&type={file_type}"
-    full_url = f"http://{comfy_address}{comfy_url_path}"
+    full_url = f"{comfy_base_url(comfy_address)}{comfy_url_path}"
     try:
-        with urllib.request.urlopen(full_url, timeout=COMFYUI_DOWNLOAD_TIMEOUT) as response, open(local_path, 'wb') as out_file:
+        with COMFYUI_OPENER.open(full_url, timeout=COMFYUI_DOWNLOAD_TIMEOUT) as response, open(local_path, 'wb') as out_file:
             shutil.copyfileobj(response, out_file)
         return output_url_for(filename, "output")
     except Exception as e:
@@ -3635,7 +3816,7 @@ def save_to_history(record):
 
 def get_comfy_history(comfy_address, prompt_id):
     try:
-        with urllib.request.urlopen(f"http://{comfy_address}/history/{prompt_id}", timeout=10) as response:
+        with COMFYUI_OPENER.open(f"{comfy_base_url(comfy_address)}/history/{prompt_id}", timeout=10) as response:
             return json.loads(response.read())
     except Exception as e:
         return {}
@@ -3643,7 +3824,7 @@ def get_comfy_history(comfy_address, prompt_id):
 def comfy_prompt_queue_state(comfy_address, prompt_id):
     """查询任务在 ComfyUI 队列里的状态：running / pending / ''(队列里没有) / None(查询失败)。"""
     try:
-        with urllib.request.urlopen(f"http://{comfy_address}/queue", timeout=5) as response:
+        with COMFYUI_OPENER.open(f"{comfy_base_url(comfy_address)}/queue", timeout=5) as response:
             data = json.loads(response.read())
     except Exception:
         return None
@@ -3654,17 +3835,296 @@ def comfy_prompt_queue_state(comfy_address, prompt_id):
                 return state
     return ""
 
-def comfy_submit_prompt(comfy_address, payload):
+# --- ComfyUI 实时进度：通过 WebSocket 订阅某个 prompt 的执行进度，供画布 output 节点展示 ---
+COMFY_PROGRESS: Dict[str, Dict[str, Any]] = {}
+COMFY_PROGRESS_LOCK = Lock()
+COMFY_PROGRESS_STOPS: Dict[str, Any] = {}
+COMFY_PROGRESS_MAX_AGE = 3600
+
+def comfy_progress_update(prompt_id, **fields):
+    with COMFY_PROGRESS_LOCK:
+        entry = COMFY_PROGRESS.setdefault(str(prompt_id), {})
+        entry.update({key: value for key, value in fields.items() if value is not None})
+        entry["updated_at"] = time.time()
+
+def comfy_progress_snapshot(prompt_id):
+    with COMFY_PROGRESS_LOCK:
+        entry = COMFY_PROGRESS.get(str(prompt_id))
+        return dict(entry) if entry else {}
+
+def comfy_progress_prune():
+    deadline = time.time() - COMFY_PROGRESS_MAX_AGE
+    with COMFY_PROGRESS_LOCK:
+        for key in [k for k, v in COMFY_PROGRESS.items() if float(v.get("updated_at") or 0) < deadline]:
+            COMFY_PROGRESS.pop(key, None)
+
+def comfy_progress_watch(comfy_address, prompt_id, stop):
+    """订阅 ComfyUI WebSocket，把该 prompt 的步骤进度写进 COMFY_PROGRESS。
+
+    ComfyUI 只把进度推给提交任务时用的 clientId，所以这里复用同一个 CLIENT_ID。
+    连接失败或断开不影响渲染，静默重连直到任务结束或被显式停止。
+    """
+    try:
+        from websockets.sync.client import connect as ws_connect
+    except Exception:
+        return
+    url = f"{comfy_ws_url(comfy_address)}/ws?clientId={CLIENT_ID}"
+    ws = None
+    while not stop.is_set():
+        if ws is None:
+            try:
+                ws = ws_connect(url, open_timeout=10, close_timeout=2)
+            except Exception:
+                ws = None
+                if stop.wait(1):
+                    return
+                continue
+        try:
+            raw = ws.recv(timeout=3)
+        except TimeoutError:
+            continue
+        except Exception:
+            try:
+                ws.close()
+            except Exception:
+                pass
+            ws = None
+            continue
+        if stop.is_set():
+            break
+        try:
+            message = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(message, dict):
+            continue
+        message_type = message.get("type")
+        data = message.get("data")
+        if not isinstance(data, dict):
+            continue
+        message_prompt = str(data.get("prompt_id") or "")
+        if message_prompt and message_prompt != str(prompt_id):
+            continue
+        if message_type == "progress":
+            comfy_progress_update(prompt_id, value=data.get("value"), max=data.get("max"), node=data.get("node"))
+        elif message_type == "executing":
+            if data.get("node") is None:
+                break
+            comfy_progress_update(prompt_id, node=data.get("node"))
+        elif message_type in ("execution_success", "execution_error", "execution_interrupted"):
+            break
+    try:
+        if ws is not None:
+            ws.close()
+    except Exception:
+        pass
+
+def stop_comfy_progress_watch(prompt_id):
+    stop = COMFY_PROGRESS_STOPS.pop(str(prompt_id), None)
+    if stop is not None:
+        stop.set()
+
+def start_comfy_progress_watch(comfy_address, prompt_id):
+    if not prompt_id:
+        return
+    comfy_progress_prune()
+    stop_comfy_progress_watch(prompt_id)
+    stop = Event()
+    COMFY_PROGRESS_STOPS[str(prompt_id)] = stop
+    comfy_progress_update(prompt_id, started_at=time.time())
+    Thread(target=comfy_progress_watch, args=(comfy_address, prompt_id, stop), daemon=True,
+           name=f"comfy-progress-{str(prompt_id)[:8]}").start()
+
+# 画布任务（/api/canvas-comfy-tasks 提交的任务）的上下文，由 generate() 所在线程读取
+COMFY_CANVAS_TASK_CTX = local()
+
+def begin_canvas_comfy_progress(comfy_address, prompt_id):
+    """提交成功后：订阅 ComfyUI 进度，并把 prompt_id 记到画布任务上，供前端轮询展示。"""
+    canvas_task_id = getattr(COMFY_CANVAS_TASK_CTX, "task_id", "") or ""
+    start_comfy_progress_watch(comfy_address, prompt_id)
+    if canvas_task_id:
+        with CANVAS_TASK_LOCK:
+            task = CANVAS_TASKS.get(canvas_task_id)
+            if task is not None:
+                task.update({"prompt_id": prompt_id, "backend": comfy_address})
+    publish_canvas_comfy_progress({"canvas_task_id": canvas_task_id, "backend": comfy_address}, prompt_id, "", 0.0)
+    return {"canvas_task_id": canvas_task_id, "backend": comfy_address}
+
+def publish_canvas_comfy_progress(ctx, prompt_id, queue_state, waited):
+    """把 ComfyUI 的实时进度写进画布任务，前端 output 节点据此展示进度。"""
+    canvas_task_id = (ctx or {}).get("canvas_task_id")
+    if not canvas_task_id:
+        return
+    snapshot = comfy_progress_snapshot(prompt_id)
+    value = snapshot.get("value")
+    total = snapshot.get("max")
+    percent = None
+    if isinstance(value, (int, float)) and isinstance(total, (int, float)) and total:
+        percent = round(float(value) / float(total) * 100, 1)
+    stage = "排队中" if queue_state == "pending" else ("渲染中" if queue_state == "running" else "提交中")
+    with CANVAS_TASK_LOCK:
+        task = CANVAS_TASKS.get(canvas_task_id)
+        if task is None:
+            return
+        task["prompt_id"] = prompt_id
+        task["backend"] = (ctx or {}).get("backend") or task.get("backend") or ""
+        task["progress"] = {
+            "prompt_id": prompt_id,
+            "backend": task["backend"],
+            "queue": queue_state or "",
+            "stage": stage,
+            "value": value,
+            "max": total,
+            "percent": percent,
+            "node": snapshot.get("node"),
+            "waited": round(float(waited or 0), 1),
+            "updated_at": time.time(),
+        }
+
+def comfy_wait_for_history(comfy_address, prompt_id, on_tick=None):
+    """轮询 ComfyUI /history 直到拿到结果；期间每秒回调 on_tick 上报进度。"""
+    wait_started = time.time()
+    last_beat = wait_started
+    last_queue_state = ""
+    missing_checks = 0
+    for _ in range(COMFYUI_HISTORY_TIMEOUT):
+        try:
+            res = get_comfy_history(comfy_address, prompt_id)
+            if prompt_id in res:
+                return res[prompt_id]
+        except Exception:
+            pass
+        queue_state = comfy_prompt_queue_state(comfy_address, prompt_id)
+        if queue_state:
+            missing_checks = 0
+            last_queue_state = queue_state
+        elif queue_state == "":
+            # 历史和队列里都找不到该任务：ComfyUI 重启/任务被清掉时就是这样，
+            # 连续几次仍找不到就判定任务丢失，避免一直空等到超时。
+            missing_checks += 1
+            if missing_checks >= 3:
+                print(f"[comfyui] 任务丢失 prompt_id={prompt_id}：ComfyUI 队列与历史中都没有该任务（服务重启或被清除）", flush=True)
+                raise Exception("ComfyUI 任务已丢失（服务重启或被清除），未拿到渲染结果")
+        now = time.time()
+        if on_tick:
+            on_tick(last_queue_state, now - wait_started)
+        if now - last_beat >= 10:
+            last_beat = now
+            print(f"[comfyui] 渲染中 prompt_id={prompt_id} 已等待 {int(now - wait_started)}s 队列={last_queue_state or '查询中'}", flush=True)
+        time.sleep(1)
+    print(f"[comfyui] 渲染超时 prompt_id={prompt_id} 已等待 {int(time.time() - wait_started)}s（上限 {COMFYUI_HISTORY_TIMEOUT}s）", flush=True)
+    raise Exception("ComfyUI 渲染超时")
+
+def comfy_queue_is_idle(comfy_address):
+    """ComfyUI 队列是否空闲（既没有运行中也没有排队中的任务）。查询失败按「不空闲」处理。"""
+    try:
+        with COMFYUI_OPENER.open(f"{comfy_base_url(comfy_address)}/queue", timeout=5) as response:
+            data = json.loads(response.read())
+    except Exception as e:
+        print(f"[comfyui] 队列状态查询失败 backend={comfy_address}：{e}", flush=True)
+        return False
+    return not (data.get("queue_running") or data.get("queue_pending"))
+
+def comfy_free_vram(comfy_address):
+    """让远端 ComfyUI 卸载驻留模型并释放显存缓存（POST /free），降低下一次运行的 OOM 概率。
+
+    这套 H3 工作流的模型总量（≈39.5GB）超过单卡显存（31.7GiB），本来就靠加载/卸载换页
+    硬撑，上一次运行留下的驻留会直接吃掉这次的余量。队列里有任务时跳过：否则会把正在
+    采样的模型卸掉、逼它重新从磁盘加载。清理失败只是少一次优化，不影响提交。
+    """
+    if not comfy_queue_is_idle(comfy_address):
+        print(f"[comfyui] 队列非空闲，跳过显存清理 backend={comfy_address}", flush=True)
+        return False
+    data = json.dumps({"unload_models": True, "free_memory": True}).encode("utf-8")
+    post_req = urllib.request.Request(f"{comfy_base_url(comfy_address)}/free", data=data)
+    post_req.add_header("Content-Type", "application/json")
+    try:
+        COMFYUI_OPENER.open(post_req, timeout=60).read()
+        print(f"[comfyui] 已清理远端显存与模型驻留 backend={comfy_address}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[comfyui] 显存清理失败（忽略）backend={comfy_address}：{e}", flush=True)
+        return False
+
+# 单个分镜能跑多长，取决于远端卡的显存：24G 卡最多 10 秒，32G 及以上可以到 15 秒。
+# H3 这套工作流的模型总量本来就超过单卡显存、靠加载/卸载换页硬撑，时长越长显存峰值越高。
+COMFY_UNIT_SECONDS_BY_VRAM = [
+    (30 * 1024 ** 3, 15),  # 32G 卡
+    (0, 10),               # 24G 卡（读不到显存时也按这个保守值）
+]
+
+def comfy_vram_total(comfy_address):
+    """远端 ComfyUI 报告的单卡显存总量（字节）；读不到返回 0。"""
+    try:
+        with COMFYUI_OPENER.open(f"{comfy_base_url(comfy_address)}/system_stats", timeout=15) as response:
+            data = json.loads(response.read())
+    except Exception as e:
+        print(f"[comfyui] 读取显存信息失败 backend={comfy_address}：{e}", flush=True)
+        return 0
+    totals = [int(device.get("vram_total") or 0) for device in (data.get("devices") or [])]
+    return max(totals or [0])
+
+def comfy_unit_seconds_limit(comfy_address):
+    """按远端卡显存算出单个分镜的时长上限（秒），一并返回显存总量。"""
+    total = comfy_vram_total(comfy_address)
+    for threshold, seconds in COMFY_UNIT_SECONDS_BY_VRAM:
+        if total >= threshold:
+            return seconds, total
+    return 10, total
+
+def comfy_all_unit_seconds_limits():
+    """每台主机的时长上限。多台显存不一样时前端算不出分镜会落到哪台，只有后端在
+    提交前后能定，所以这里只是把各台的档位报出来，实际夹取发生在 apply_unit_duration。"""
+    limits = []
+    for addr in COMFYUI_INSTANCES:
+        seconds, total = comfy_unit_seconds_limit(addr)
+        limits.append({
+            "backend": addr,
+            "vram_total": total,
+            "vram_gb": round(total / 1024 ** 3, 1) if total else 0,
+            "max_duration_seconds": seconds,
+        })
+    return limits
+
+def apply_unit_duration(workflow, duration_param, comfy_address):
+    """分镜自己写的秒数按实际分配到的这张卡夹一次：24G 卡最多 10 秒，32G 卡才到 15 秒。
+    只往下夹，不会把分镜写的短时长抬长。"""
+    if not isinstance(duration_param, dict):
+        return None
+    seconds = duration_param.get("seconds")
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or seconds <= 0:
+        return None
+    input_name = str(duration_param.get("input") or "")
+    if not input_name:
+        return None
+    limit, vram_total = comfy_unit_seconds_limit(comfy_address)
+    value = min(float(seconds), float(limit))
+    if value == int(value):
+        value = int(value)
+    for node_id in duration_param.get("nodes") or []:
+        node_id = str(node_id)
+        if node_id not in workflow:
+            continue
+        workflow.setdefault(node_id, {}).setdefault("inputs", {})[input_name] = value
+    if value != seconds:
+        print(f"[comfyui] 时长按后端显存下调 backend={comfy_address} "
+              f"vram={round(vram_total / 1024 ** 3, 1)}G 分镜写={seconds}s 实际={value}s", flush=True)
+    return value
+
+def comfy_submit_prompt(comfy_address, payload, free_memory=False):
     """提交渲染任务并返回 prompt_id；连接超时、502/503/504 等临时故障自动重试。
 
     注意：若某次尝试其实已提交成功、只是响应没收到，重试会再提交一次同一个工作流。
+    free_memory 为真时先清一次远端显存，放在重试循环之外，避免每次重试都重复清理。
     """
+    if free_memory:
+        comfy_free_vram(comfy_address)
     data = json.dumps(payload).encode('utf-8')
     last_error = ""
     for attempt in range(1, COMFYUI_SUBMIT_ATTEMPTS + 1):
         try:
-            post_req = urllib.request.Request(f"http://{comfy_address}/prompt", data=data)
-            prompt_id = json.loads(urllib.request.urlopen(post_req, timeout=COMFYUI_SUBMIT_TIMEOUT).read())['prompt_id']
+            post_req = urllib.request.Request(f"{comfy_base_url(comfy_address)}/prompt", data=data)
+            prompt_id = json.loads(COMFYUI_OPENER.open(post_req, timeout=COMFYUI_SUBMIT_TIMEOUT).read())['prompt_id']
             if attempt > 1:
                 print(f"[comfyui] 提交成功（第 {attempt} 次尝试）prompt_id={prompt_id}", flush=True)
             return prompt_id
@@ -7587,20 +8047,58 @@ def asset_library_safe_extension(path: str, kind: str) -> str:
     fallback = {"image": ".png", "video": ".mp4", "audio": ".mp3", "workflow": ".zip"}
     return ext if ext in allowed.get(kind, allowed["image"]) else fallback.get(kind, ".png")
 
-def unique_asset_category_dir(library, base_name: str) -> str:
-    """为资产库分组生成一个唯一、文件系统安全的子文件夹名（library/<dir>/）。
-    以分组名为基础（保留中文），与同库其它分组的 dir 及磁盘上已存在的文件夹去重。"""
-    base = sanitize_asset_name(base_name, "分组").strip(" .") or "分组"
+def unique_library_category_dir(library, category_name: str) -> str:
+    """素材库分组的文件夹按「库名 / 分组名」两层放（library/<库名>/<分组名>/）。
+
+    这样磁盘上也能一眼看出素材属于哪个库（哪个剧本）、是哪一类；库名重名时给库名加序号。
+    """
+    root = sanitize_asset_name(library.get("name") or "素材库", "素材库").strip(" .") or "素材库"
     existing = {
         str(c.get("dir")) for c in (library.get("categories") or [])
         if isinstance(c, dict) and c.get("dir")
     }
-    candidate = base
+    candidate = f"{root}/{category_name}"
     i = 2
     while candidate in existing or os.path.exists(os.path.join(ASSET_LIBRARY_DIR, candidate)):
-        candidate = f"{base}_{i}"
+        candidate = f"{root}_{i}/{category_name}"
         i += 1
     return candidate
+
+def media_group_category(library, kind: str):
+    """取库里某一类媒体的标准分组（video → 生成视频、image → 生成图片），没有就补一个。"""
+    category_id, category_name = SCRIPT_MEDIA_LIBRARY_CATEGORY[kind]
+    cat = next(
+        (c for c in (library.get("categories") or []) if c.get("type") == "image" and c.get("id") == category_id),
+        None,
+    ) or find_script_library_category(library, category_name)
+    if cat:
+        return cat
+    cat = {"id": category_id, "name": category_name, "type": "image", "items": []}
+    cat["dir"] = unique_library_category_dir(library, category_name)
+    try:
+        os.makedirs(os.path.join(ASSET_LIBRARY_DIR, cat["dir"]), exist_ok=True)
+    except Exception as exc:
+        print(f"创建分组文件夹失败: {exc}")
+    library.setdefault("categories", []).append(cat)
+    return cat
+
+def route_media_category(library, category, src: str):
+    """按文件本身的类型决定素材进哪个分组，不看调用来源传的类型。
+
+    - 视频一律进「生成视频」，图片一律进「生成图片」；
+    - 人物 / 场景这类语义分组只收图片，所以图片进它们时保持不动；
+    - 类型和分组对不上（比如视频被存进图片分组）就自动改到对应的标准分组。
+    """
+    file_kind = asset_library_media_kind(src or "")
+    if file_kind not in ("video", "image") or not category:
+        return category
+    video_id, video_name = SCRIPT_MEDIA_LIBRARY_CATEGORY["video"]
+    is_video_group = category.get("id") == video_id or video_name in str(category.get("name") or "")
+    if file_kind == "video" and not is_video_group:
+        return media_group_category(library, "video")
+    if file_kind == "image" and is_video_group:
+        return media_group_category(library, "image")
+    return category
 
 def remove_asset_library_file(item) -> None:
     """删除资产对应的本地文件（仅限 library 副本，删了不影响 /output 原图）。日志不影响主流程。"""
@@ -7763,6 +8261,8 @@ def normalize_asset_classification(raw):
         flat_unique.append(item)
     return {
         "summary": str(raw.get("summary") or "").strip()[:240],
+        # 模型顺手给的归类建议（角色 / 场景 / 生成图片），素材入库时按它决定放哪个分组
+        "group": str(raw.get("group") or "").strip()[:24],
         "categories": clean_categories,
         "tags": clean_tags,
         "flat": flat_unique,
@@ -7824,52 +8324,192 @@ async def classify_asset_image_best_effort(abs_path, provider_id="", model="", m
         print(f"素材智能分类失败: {exc}")
         return None
 
+# 素材入库时让智能分类顺手给出归类建议，之后按内容把图片放到 角色 / 场景 / 生成图片 分组
+ASSET_GROUP_ROUTING_INSTRUCTION = (
+    "另外请在 JSON 顶层加一个 \"group\" 字段，取值只能是「角色」「场景」「生成图片」三者之一："
+    "以人物 / 角色形象为主体的选「角色」；以环境空间为主体的选「场景」（画面里有人但环境才是主体时也算场景）；"
+    "其余（产品、静物、封面、文字图等）选「生成图片」。"
+)
+
+ASSET_SEMANTIC_GROUPS = ("角色", "场景", "生成图片")
+
+
+def asset_semantic_group(classification) -> str:
+    """从智能分类结果里取语义分组名（角色 / 场景 / 生成图片）；没给或给的不是这三个就返回空。"""
+    if not isinstance(classification, dict):
+        return ""
+    group = str(classification.get("group") or "").strip()
+    for name in ASSET_SEMANTIC_GROUPS:
+        if name in group:
+            return name
+    return ""
+
+
+def route_media_category_by_content(library, category, classification):
+    """按图片内容（智能分类给出的 group）把素材归到 角色 / 场景 / 生成图片 分组。
+
+    模型没给出可用的归类建议、或库里没有对应分组时保持原样。
+    """
+    name = asset_semantic_group(classification)
+    if not name:
+        return category
+    target = find_script_library_category(library, name)
+    if not target or target is category or target.get("type") != "image":
+        return category
+    return target
+
+def asset_library_root_name(library) -> str:
+    """素材库在磁盘上的顶层文件夹名（库名去掉文件系统不认的字符）。"""
+    return sanitize_asset_name(library.get("name") or "素材库", "素材库").strip(" .") or "素材库"
+
+def rewrite_asset_library_urls(moves) -> None:
+    """素材换了文件夹之后，把画布里指向旧路径的 URL 一起改过来。
+
+    moves: {旧目录相对路径: 新目录相对路径}。URL 里中文是百分号编码的，
+    原样和编码两种写法都要换。
+    """
+    if not moves or not os.path.isdir(CANVAS_DIR):
+        return
+    pairs = []
+    for old_dir, new_dir in moves.items():
+        pairs.append((
+            f"/assets/library/{old_dir}/",
+            f"/assets/library/{new_dir}/",
+        ))
+        pairs.append((
+            "/assets/library/" + urllib.parse.quote(old_dir, safe="/") + "/",
+            "/assets/library/" + urllib.parse.quote(new_dir, safe="/") + "/",
+        ))
+    for filename in os.listdir(CANVAS_DIR):
+        if not filename.endswith(".json"):
+            continue
+        path = os.path.join(CANVAS_DIR, filename)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except Exception:
+            continue
+        original = text
+        for old_form, new_form in pairs:
+            text = text.replace(old_form, new_form)
+        if text == original:
+            continue
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            print(f"素材目录整理：已更新画布 {filename} 里的素材路径")
+        except Exception as exc:
+            print(f"素材目录整理：更新画布 {filename} 失败 {exc}")
+
 def migrate_asset_library_into_dirs():
-    """一次性整理：给所有图片分组（含默认的角色/场景）补上真实文件夹，并把仍在 library/ 根目录的
-    素材文件搬进各自分组的文件夹、同步更新 URL。幂等：已经在子文件夹里的不动；可安全反复执行。"""
+    """整理素材文件夹：图片分组统一按 library/<库名>/<分组名>/ 两层来放。
+
+    - 分组还没有目录的补上；原来散在 library/ 根目录、旧一层目录（角色、角色_2 …）里的文件
+      搬进新目录，素材库和画布里的 URL 同步改掉；
+    - 旧目录里没被素材库登记过的历史文件，也按目录名归到同名分组下，磁盘上不再散着一堆同级目录；
+    - 幂等：已经在新目录里的不动，可反复执行。
+    """
     try:
         lib = load_asset_library()
     except Exception as exc:
-        print(f"资产库分组整理：加载失败 {exc}")
+        print(f"素材目录整理：加载失败 {exc}")
         return
     changed = False
+    moves = {}
+    used_dirs = set()
+    targets = []
+    # 每个图片分组的目标目录：库名 / 分组名（同名分组给库名加序号，避免撞在一起）
     for library in lib.get("libraries", []) or []:
+        root = asset_library_root_name(library)
         for cat in library.get("categories", []) or []:
             if (cat.get("type") or "image") != "image":
                 continue
-            if not cat.get("dir"):
-                cat["dir"] = unique_asset_category_dir(library, cat.get("name") or "分组")
-                changed = True
-            cat_dir = str(cat.get("dir") or "").strip("/").strip()
-            if not cat_dir:
+            cat_name = cat.get("name") or "分组"
+            target = f"{root}/{cat_name}"
+            i = 2
+            while target in used_dirs:
+                target = f"{root}_{i}/{cat_name}"
+                i += 1
+            used_dirs.add(target)
+            targets.append((library, cat, target))
+    # 一、素材库里登记过的文件：按 URL 认位置，搬到目标目录并改写 URL
+    for library, cat, target in targets:
+        old_dir = str(cat.get("dir") or "").strip("/").strip()
+        if old_dir != target:
+            if old_dir:
+                moves.setdefault(old_dir, target)
+            cat["dir"] = target
+            changed = True
+        new_abs = os.path.join(ASSET_LIBRARY_DIR, *target.split("/"))
+        try:
+            os.makedirs(new_abs, exist_ok=True)
+        except Exception as exc:
+            print(f"素材目录整理：建文件夹失败 {target} {exc}")
+            continue
+        for item in (cat.get("items") or []):
+            rel = urllib.parse.unquote(str(item.get("url") or "").split("?", 1)[0])
+            match = re.match(r"^/assets/library/(.+)$", rel)
+            if not match:
                 continue
+            inner = match.group(1).strip("/")
+            if inner.startswith(target + "/"):
+                continue
+            filename = os.path.basename(inner)
+            src = os.path.join(ASSET_LIBRARY_DIR, *inner.split("/"))
+            if not os.path.isfile(src):
+                continue
+            dst = os.path.join(new_abs, filename)
             try:
-                os.makedirs(os.path.join(ASSET_LIBRARY_DIR, cat_dir), exist_ok=True)
+                if not os.path.exists(dst):
+                    shutil.move(src, dst)
+                item["url"] = "/assets/library/" + urllib.parse.quote(f"{target}/{filename}", safe="/")
+                changed = True
             except Exception as exc:
-                print(f"资产库分组整理：建文件夹失败 {exc}")
+                print(f"素材目录整理：搬运 {inner} 失败 {exc}")
+    # 二、旧目录里没登记过的历史文件：按目录名认分组，一样归到目标目录
+    root_names = {asset_library_root_name(library) for library in (lib.get("libraries") or [])}
+    if os.path.isdir(ASSET_LIBRARY_DIR):
+        for entry in sorted(os.listdir(ASSET_LIBRARY_DIR)):
+            path = os.path.join(ASSET_LIBRARY_DIR, entry)
+            if not os.path.isdir(path) or entry in root_names:
                 continue
-            for item in (cat.get("items") or []):
-                raw_url = urllib.parse.unquote(str(item.get("url") or "").split("?", 1)[0])
-                m = re.match(r"^/assets/library/([^/]+)$", raw_url)  # 仅匹配仍在根目录的文件
-                if not m:
-                    continue
-                fname = m.group(1)
-                src = os.path.join(ASSET_LIBRARY_DIR, fname)
+            target = ''
+            for _library, cat, cat_target in targets:
+                cat_name = cat.get("name") or ""
+                if cat_name and (entry == cat_name or re.fullmatch(re.escape(cat_name) + r"_\d+", entry)):
+                    target = cat_target
+                    break
+            if not target:
+                continue
+            moves.setdefault(entry, target)
+            target_abs = os.path.join(ASSET_LIBRARY_DIR, *target.split("/"))
+            try:
+                os.makedirs(target_abs, exist_ok=True)
+            except Exception as exc:
+                print(f"素材目录整理：建文件夹失败 {target} {exc}")
+                continue
+            for filename in os.listdir(path):
+                src = os.path.join(path, filename)
                 if not os.path.isfile(src):
                     continue
-                dst = os.path.join(ASSET_LIBRARY_DIR, cat_dir, fname)
+                dst = os.path.join(target_abs, filename)
                 try:
                     if not os.path.exists(dst):
                         shutil.move(src, dst)
-                    item["url"] = "/assets/library/" + urllib.parse.quote(f"{cat_dir}/{fname}", safe="/")
-                    changed = True
+                        changed = True
                 except Exception as exc:
-                    print(f"资产库分组整理：搬运 {fname} 失败 {exc}")
+                    print(f"素材目录整理：搬运历史文件 {entry}/{filename} 失败 {exc}")
+            try:
+                os.rmdir(path)   # 搬空了才删得掉，还有子目录就留着
+            except OSError:
+                pass
+    if moves:
+        rewrite_asset_library_urls(moves)
     if changed:
         try:
             save_asset_library(lib)
         except Exception as exc:
-            print(f"资产库分组整理：保存失败 {exc}")
+            print(f"素材目录整理：保存失败 {exc}")
 
 def asset_library_workflow_category(lib, library_id="", category_id=""):
     library = find_asset_library(lib, library_id)
@@ -11862,9 +12502,9 @@ def view_image(filename: str, type: str = "input", subfolder: str = ""):
     # 先按原逻辑去各 ComfyUI 后端找
     for addr in COMFYUI_INSTANCES:
         try:
-            url = f"http://{addr}/view"
+            url = f"{comfy_base_url(addr)}/view"
             params = {"filename": filename, "type": type, "subfolder": subfolder}
-            r = requests.get(url, params=params, timeout=1)
+            r = requests.get(url, params=params, timeout=1, proxies=COMFYUI_NO_PROXY)
             if r.status_code == 200:
                 return Response(content=r.content, media_type=r.headers.get('Content-Type'))
         except Exception:
@@ -12010,6 +12650,54 @@ async def export_minimax_timeline(payload: MiniMaxTimelineExportRequest):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+# 同一份素材（内容哈希相同）在同一台 ComfyUI 上只上传一次：
+# 反复生成、或同一批参考素材里有重复图片时直接复用，省掉整轮上传耗时
+COMFY_UPLOAD_CACHE: Dict[Tuple[str, str], str] = {}
+COMFY_UPLOAD_INFLIGHT: Dict[Tuple[str, str], Any] = {}
+
+def comfy_input_file_ready(addr, name):
+    """确认这份素材还留在 ComfyUI 的 input 目录里，否则缓存作废、重新上传。"""
+    if not name:
+        return False
+    url = f"{comfy_base_url(addr)}/view?filename={urllib.parse.quote(str(name))}&type=input"
+    try:
+        resp = requests.head(url, timeout=min(COMFYUI_UPLOAD_TIMEOUT, 30.0), proxies=COMFYUI_NO_PROXY)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+async def comfy_upload_to_backend(addr, file, content, digest):
+    """把一份素材传到指定 ComfyUI 并返回 comfy 文件名；同一份内容并发时只真正上传一次。"""
+    key = (digest, addr)
+    cached_name = COMFY_UPLOAD_CACHE.get(key)
+    if cached_name:
+        if await asyncio.to_thread(comfy_input_file_ready, addr, cached_name):
+            return cached_name
+        COMFY_UPLOAD_CACHE.pop(key, None)
+    pending = COMFY_UPLOAD_INFLIGHT.get(key)
+    if pending is not None:
+        return await asyncio.shield(pending)
+    fut = asyncio.get_running_loop().create_future()
+    COMFY_UPLOAD_INFLIGHT[key] = fut
+    try:
+        files_data = {'image': (file.filename, content, file.content_type)}
+        # 放到线程里执行：requests 是同步阻塞库，直接 await 会卡死整个事件循环
+        # （远端 ComfyUI 假死时连接不断开、也不读数据，send 会无限阻塞，导致本地服务所有请求超时）
+        response = await asyncio.to_thread(requests.post, f"{comfy_base_url(addr)}/upload/image", files=files_data,
+                                           timeout=COMFYUI_UPLOAD_TIMEOUT, proxies=COMFYUI_NO_PROXY)
+        if response.status_code != 200:
+            raise RuntimeError(f"HTTP {response.status_code}")
+        name = response.json().get("name") or file.filename
+        COMFY_UPLOAD_CACHE[key] = name
+        fut.set_result(name)
+        return name
+    except Exception as exc:
+        fut.set_exception(exc)
+        fut.add_done_callback(lambda f: f.exception())
+        raise
+    finally:
+        COMFY_UPLOAD_INFLIGHT.pop(key, None)
+
 @app.post("/api/upload")
 async def upload_image(files: List[UploadFile] = File(...)):
     uploaded_files = []
@@ -12021,17 +12709,15 @@ async def upload_image(files: List[UploadFile] = File(...)):
     for file, content in files_content:
         success_count = 0
         last_result = None
+        digest = hashlib.sha256(content).hexdigest() if content else ""
         for addr in COMFYUI_INSTANCES:
             try:
-                files_data = {'image': (file.filename, content, file.content_type)}
-                # 放到线程里执行：requests 是同步阻塞库，直接 await 会卡死整个事件循环
-                # （远端 ComfyUI 假死时连接不断开、也不读数据，send 会无限阻塞，导致本地服务所有请求超时）
-                response = await asyncio.to_thread(requests.post, f"http://{addr}/upload/image", files=files_data, timeout=5)
-                if response.status_code == 200:
-                    last_result = response.json()
-                    success_count += 1
+                name = await comfy_upload_to_backend(addr, file, content, digest)
             except Exception as e:
                 print(f"Upload error for {addr}: {e}")
+                continue
+            success_count += 1
+            last_result = {"name": name}
 
         if success_count > 0 and last_result:
             uploaded_files.append({"comfy_name": last_result.get("name", file.filename)})
@@ -12136,8 +12822,9 @@ async def upload_comfyui_base64(payload: Base64UploadRequest):
     comfy_name = None
     for addr in COMFYUI_INSTANCES:
         try:
-            resp = await asyncio.to_thread(requests.post, f"http://{addr}/upload/image",
-                                           files={'image': (filename, content, ct or 'image/png')}, timeout=10)
+            resp = await asyncio.to_thread(requests.post, f"{comfy_base_url(addr)}/upload/image",
+                                           files={'image': (filename, content, ct or 'image/png')},
+                                           timeout=COMFYUI_UPLOAD_TIMEOUT, proxies=COMFYUI_NO_PROXY)
             if resp.status_code == 200:
                 comfy_name = resp.json().get("name", filename)
         except Exception as exc:
@@ -14711,13 +15398,21 @@ async def get_canvas_image_task(task_id: str):
         raise HTTPException(status_code=404, detail="画布任务不存在，可能服务已重启或任务已过期")
     return task
 
+def run_generate_for_canvas_task(task_id: str, payload: GenerateRequest):
+    """在独立线程里跑 generate()，并把画布任务 id 告诉它，便于上报 ComfyUI 渲染进度。"""
+    COMFY_CANVAS_TASK_CTX.task_id = task_id
+    try:
+        return generate(payload)
+    finally:
+        COMFY_CANVAS_TASK_CTX.task_id = ""
+
 async def run_canvas_comfy_task(task_id: str, payload: GenerateRequest):
     with CANVAS_TASK_LOCK:
         if task_id in CANVAS_TASKS:
             CANVAS_TASKS[task_id]["status"] = "running"
             CANVAS_TASKS[task_id]["updated_at"] = time.time()
     try:
-        result = await asyncio.to_thread(generate, payload)
+        result = await asyncio.to_thread(run_generate_for_canvas_task, task_id, payload)
         if isinstance(result, dict) and result.get("error"):
             raise RuntimeError(str(result.get("error") or "ComfyUI 生成失败"))
         with CANVAS_TASK_LOCK:
@@ -16902,11 +17597,1396 @@ async def delete_prompt_library_category(category_id: str):
     data = save_prompt_libraries(data)
     return {"library": public_prompt_libraries(data)}
 
+# ============================================================
+# 剧本分镜：上传剧本 → 提取人物与场景 → 生成分镜提示词 → 提交 ComfyUI
+# ============================================================
+
+# 人物与场景提取用的内置模板目录（与分镜模板分开，避免混进同一个下拉框）
+SCRIPT_CAST_TEMPLATE_DIR = os.path.join(STATIC_DIR, "system-prompts", "script-cast")
+
+# 单元标题：## P01｜15秒｜段名（允许 ###、加粗和全角/半角分隔符）
+SCRIPT_UNIT_HEADING_RE = re.compile(r"^#{2,4}[ \t]*\**\s*P\s*\d{1,3}\b[^\n]*$", re.MULTILINE)
+
+SCRIPT_FENCE_RE = re.compile(r"```[a-zA-Z]*[ \t]*\n(.*?)```", re.DOTALL)
+
+
+def load_script_cast_templates():
+    """内置的人物与场景提取模板（static/system-prompts/script-cast/ 下的 .md/.txt）。"""
+    templates = []
+    try:
+        names = sorted(os.listdir(SCRIPT_CAST_TEMPLATE_DIR))
+    except Exception:
+        names = []
+    for name in names:
+        if not name.lower().endswith((".md", ".txt")):
+            continue
+        try:
+            with open(os.path.join(SCRIPT_CAST_TEMPLATE_DIR, name), "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        except Exception as e:
+            print(f"读取人物与场景模板失败 {name}: {e}")
+            continue
+        if not content:
+            continue
+        title = ""
+        for line in content.splitlines():
+            if line.strip().startswith("#"):
+                title = line.strip().lstrip("#").strip()
+                break
+        body = content.split("\n", 1)[1] if "\n" in content else ""
+        templates.append({
+            "id": os.path.splitext(name)[0],
+            "name": title or os.path.splitext(name)[0],
+            "description": re.sub(r"\s+", " ", body).strip()[:140],
+            "content": content,
+            "source": "builtin",
+        })
+    return templates
+
+
+def find_script_cast_template(template_id: str):
+    target = str(template_id or "").strip()
+    items = load_script_cast_templates()
+    if not target and items:
+        return items[0]
+    return next((item for item in items if item["id"] == target), None)
+
+
+def load_script_user_templates():
+    """读取用户「存为常用」的剧本提示词。"""
+    if not os.path.exists(SCRIPT_USER_TEMPLATE_PATH):
+        return []
+    try:
+        with open(SCRIPT_USER_TEMPLATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"读取剧本常用提示词失败: {e}")
+        return []
+    items = data.get("templates") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if not content or not name:
+            continue
+        result.append({
+            "id": str(item.get("id") or "").strip() or f"user-{now_ms()}",
+            "name": name,
+            "description": re.sub(r"\s+", " ", content).strip()[:140],
+            "content": content,
+            "source": "user",
+        })
+    return result
+
+
+def save_script_user_templates(items):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(SCRIPT_USER_TEMPLATE_PATH, "w", encoding="utf-8") as f:
+        json.dump({"templates": items, "updated_at": now_ms()}, f, ensure_ascii=False, indent=2)
+    return items
+
+
+def load_script_prompt_templates():
+    """内置提示词（static/system-prompts/script/ 下的 .md/.txt）+ 用户存为常用的提示词。"""
+    templates = []
+    try:
+        names = sorted(os.listdir(SCRIPT_PROMPT_TEMPLATE_DIR))
+    except Exception:
+        names = []
+    for name in names:
+        if not name.lower().endswith((".md", ".txt")):
+            continue
+        try:
+            with open(os.path.join(SCRIPT_PROMPT_TEMPLATE_DIR, name), "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        except Exception as e:
+            print(f"读取剧本默认提示词失败 {name}: {e}")
+            continue
+        if not content:
+            continue
+        title = ""
+        for line in content.splitlines():
+            if line.strip().startswith("#"):
+                title = line.strip().lstrip("#").strip()
+                break
+        body = content.split("\n", 1)[1] if "\n" in content else ""
+        templates.append({
+            "id": os.path.splitext(name)[0],
+            "name": title or os.path.splitext(name)[0],
+            "description": re.sub(r"\s+", " ", body).strip()[:140],
+            "content": content,
+            "source": "builtin",
+        })
+    return templates + load_script_user_templates()
+
+
+def find_script_prompt_template(template_id: str):
+    target = str(template_id or "").strip()
+    return next((item for item in load_script_prompt_templates() if item["id"] == target), None)
+
+
+def extract_script_outline(head_text: str):
+    """取「# 分段大纲」章节，展示本次生成的规划结果。"""
+    lines = str(head_text or "").split("\n")
+    start = next((i for i, line in enumerate(lines) if "分段大纲" in line), None)
+    if start is None:
+        return ""
+    # 大标题本身不含信息，去掉标题行
+    return "\n".join(lines[start + 1:]).strip()
+
+
+def extract_script_unit_prompt(body: str):
+    """优先取代码块内的提示词正文；没有代码块时退回整段（去掉残留围栏）。"""
+    text = str(body or "").strip()
+    blocks = [block.strip() for block in SCRIPT_FENCE_RE.findall(text)]
+    blocks = [block for block in blocks if block]
+    if blocks:
+        return "\n\n".join(blocks)
+    return re.sub(r"^\s*```[a-zA-Z]*\s*$", "", text, flags=re.MULTILINE).strip()
+
+
+def parse_script_units(markdown: str):
+    """把 LLM 产出的 Markdown 解析成 (大纲, 单元列表)。解析失败时单元为空，但原文仍完整返回。"""
+    text = str(markdown or "").replace("\r\n", "\n")
+    matches = list(SCRIPT_UNIT_HEADING_RE.finditer(text))
+    outline = extract_script_outline(text[:matches[0].start()]) if matches else ""
+    units = []
+    for pos, match in enumerate(matches):
+        end = matches[pos + 1].start() if pos + 1 < len(matches) else len(text)
+        heading = match.group(0)
+        code_match = re.search(r"P\s*\d{1,3}", heading)
+        code = re.sub(r"\s+", "", code_match.group(0)).upper() if code_match else f"P{pos + 1:02d}"
+        rest = heading[code_match.end():] if code_match else heading
+        rest = rest.strip().strip("*#").strip()
+        tail = [part.strip().strip("*#").strip() for part in re.split(r"[｜|]", rest) if part.strip()]
+        body = text[match.end():end].strip()
+        units.append({
+            "code": code,
+            "duration": tail[0] if len(tail) > 1 else "",
+            "name": tail[1] if len(tail) > 1 else (tail[0] if tail else ""),
+            "prompt": extract_script_unit_prompt(body),
+            "raw": body,
+        })
+    return outline, units
+
+
+def build_script_system_prompt(template: str, allow_rewrite: bool, notes: str, characters: str = ""):
+    rewrite_rule = (
+        "允许在不改变人物意图、笑点和关系结果的前提下压缩重复信息与冗余台词。"
+        if allow_rewrite
+        else "不得改写或删除原作台词，只能按自然分句拆开；容量超限时在关系转折处分段。"
+    )
+    lines = [
+        str(template or "").strip(),
+        "",
+        "---",
+        "",
+        "## 本次交付要求（与上文冲突时以本节为准）",
+        "",
+        "- 单元数量由剧本本身决定：按上文每个单元 10–15 秒的容量与拆分规则自然分段，"
+        "剧本有多少内容就输出多少个单元，不要为了凑数量而拆碎，也不要为了省事而把多段剧情硬压进一个单元。",
+        "- 必须把剧本正文全部拆完，不能只输出大纲或前几个单元就停下。",
+        f"- {rewrite_rule}",
+        "- 只输出 Markdown，不要任何前言、结语、解释、评分或自我检查过程。",
+        "- 先输出 `# 分段大纲` 章节，条目格式严格为 `1. P01｜15秒｜段名`，每条下面缩进列出「有效台词 / 事件 / 关系变化 / 结尾落点」。",
+        "- 大纲之后，每个单元用一个二级标题独占一行，格式严格为 `## P01｜15秒｜段名`。",
+        "- 每个单元标题之后，紧接着用一个 ```text 代码块包裹该单元的完整提示词正文：从 `<Subject1>...` 开始，到最后的【强制声明】那一段结束。",
+        "- 代码块内只放提示词正文，不要单元标题、编号、说明或额外注释；台词必须是中文。",
+        "- 不要输出「填写规则」「生成前引导流程」「交付前检查」等模板说明章节，也不要保留方括号占位符。",
+    ]
+    if str(characters or "").strip():
+        lines += [
+            "",
+            "## 人物与场景设定（固定设定，优先级高于模板与剧本正文）",
+            "",
+            str(characters).strip(),
+            "",
+            "- 以上是人物与场景的固定设定：其中的年龄、体态、脸型、眉眼、瞳色、发型、皮肤与手、伤与残、"
+            "服装材质与磨损、标志性道具，以及场景的空间结构、尺度、光源方向与主色调，全部视为不可更改的事实。",
+            "- 设定若为英文（面向出图平台写成），请把这些事实准确翻译成中文写进单元提示词："
+            "不要照抄英文原句，也不要把负面词、固定尾缀、代码块搬进单元提示词，但已给定的属性一个都不能增删或改换。",
+            "- 同一角色在所有单元里的外观描述必须完全一致；设定中未提及的元素可以按剧本正文与模板规则补充。",
+        ]
+    if str(notes or "").strip():
+        lines += ["", "## 用户补充要求", "", str(notes).strip()]
+    return "\n".join(lines)
+
+
+def build_script_user_prompt(script_content: str, characters: str = ""):
+    cast_rule = (
+        "人物与场景以系统提示词中的「人物与场景设定」为准，姓名、英文名、外观锚点、声线与场景描述必须逐字沿用；"
+        "剧本正文里出现但设定中未列出的次要角色，再按同样规则补充。"
+        if str(characters or "").strip()
+        else "角色信息请从剧本正文中自动抽取（姓名、性别、年龄段、外观锚点、声线特征）；"
+             "同一角色在全篇必须使用完全一致的英文名、外观锚点和声线描述。"
+    )
+    return (
+        "以下是剧本正文，请按系统提示词的规则拆分单元，并输出每个单元的完整提示词。\n\n"
+        f"{cast_rule}\n"
+        "人名统一转换为 `Xiao Chen` 形式的拼音：英文字母、每音节首字母大写、音节间一个半角空格。\n\n"
+        "---- 剧本正文开始 ----\n"
+        f"{script_content}\n"
+        "---- 剧本正文结束 ----"
+    )
+
+
+def build_script_chat_system_prompt(template: str, characters: str = ""):
+    """对话式补分镜：沿用同一套分镜模板，但只让它补新的那几条。"""
+    lines = [
+        str(template or "").strip(),
+        "",
+        "---",
+        "",
+        "## 本次交付要求（与上文冲突时以本节为准）",
+        "",
+        "这次不是在拆整本剧本，而是在已有分镜的基础上**只补写用户要的那几个新分镜**。",
+        "",
+        "- 只输出新增的分镜，不要重复已有分镜里已经写过的内容，也不要把整本剧本重拆一遍。",
+        "- 条数按用户的要求来：要几条就写几条；用户没说条数时，按内容需要写 1–3 条。",
+        "- 每条新分镜都要完整可用：按上文模板与拆分规则写，每个单元同样按 10–15 秒的容量。",
+        "- 编号从 P01 开始顺排即可（P01、P02、P03…）：真正插进分镜表时的编号由页面决定，不用管。",
+        "- 每条分镜用一个二级标题独占一行，格式严格为 `## P01｜15秒｜段名`。",
+        "- 标题之后紧接着用一个 ```text 代码块包裹该条的完整提示词正文："
+        "从 `<Subject1>...` 开始，到最后的【强制声明】那一段结束。",
+        "- 代码块内只放提示词正文，不要编号、说明或额外注释；台词必须是中文。",
+        "- 只输出这些分镜的 Markdown，不要前言、结语、解释、评分或自我检查过程。",
+        "- 如果用户这句话不是要新分镜（只是在讨论、追问、提修改意见），"
+        "就用几句简短中文回答，不要硬凑成分镜格式。",
+    ]
+    if str(characters or "").strip():
+        lines += [
+            "",
+            "## 人物与场景设定（固定设定，优先级高于模板与剧本正文）",
+            "",
+            str(characters).strip(),
+            "",
+            "- 以上设定里的年龄、体态、脸型、眉眼、瞳色、发型、皮肤与手、伤与残、"
+            "服装材质与磨损、标志性道具，以及场景的空间结构、尺度、光源方向与主色调，"
+            "全部视为不可更改的事实，新分镜必须逐条沿用。",
+            "- 设定若为英文（面向出图平台写成），请把这些事实准确翻译成中文写进新分镜："
+            "不要照抄英文原句，也不要把负面词、固定尾缀、代码块搬进来，但已给定的属性一个都不能增删或改换。",
+        ]
+    return "\n".join(lines)
+
+
+def build_script_chat_user_prompt(script_content: str, units, instruction: str):
+    lines = []
+    summary = [u for u in (units or []) if isinstance(u, dict)]
+    if summary:
+        lines += [
+            "## 已有分镜（只列编号与段名，写新分镜时不要与这些重复）",
+            "",
+        ]
+        for unit in summary[:800]:
+            code = str(unit.get("code") or "").strip()
+            name = str(unit.get("name") or "").strip()
+            lines.append(f"- {code} {name}".rstrip())
+        if len(summary) > 800:
+            lines.append(f"- …（还有 {len(summary) - 800} 条，未全部列出）")
+        lines.append("")
+    lines += [
+        "## 用户要求",
+        "",
+        str(instruction or "").strip(),
+        "",
+        "---- 剧本正文开始 ----",
+        str(script_content or ""),
+        "---- 剧本正文结束 ----",
+    ]
+    return "\n".join(lines)
+
+
+def build_script_cast_system_prompt(template: str, only: str = ""):
+    """only="prop" 时只出道具，人物与场景一个字都不动（已生成的参考图靠提示词匹配，
+    重写人物/场景会把那些图全冲掉）。"""
+    lines = [
+        str(template or "").strip(),
+        "",
+        "---",
+        "",
+        "## 本次交付要求（与上文冲突时以本节为准）",
+        "",
+        "- 素材来源只有下方用户消息里的剧本正文，没有别的文件："
+        "上文提到的「找素材真源」「列章节检索」「出图节奏」「读回图片核对」等步骤一律跳过。",
+        "- 直接完成提取与写作，不要反问、不要要求用户补充信息、不要输出计划或确认环节。",
+    ]
+    if only == "prop":
+        lines += [
+            "- 这次**只提取道具**：不要输出人物清单、人物三视图，也不要输出场景清单、场景图，"
+            "只输出道具相关的两节。",
+            "- 输出结构固定为两节：先 `## 道具清单`（一行一件道具，写清名称、类别与它在剧情里的作用），"
+            "再逐个道具给出其完整提示词。",
+            "- 每件道具给出完整提示词与道具负面词；按「道具图模板」写：画面里不得出现任何人的痕迹"
+            "（无手、无指头、无模特、无人影），平色无缝底、匀光、无强烈投影。",
+            "- 每件道具必须写死材质、磨损位置、颜色与主色调，以及刻字或标识内容（没有就写 plain and unmarked）；"
+            "同一件道具在后续所有单元里沿用同一套描述。",
+        ]
+    else:
+        lines += [
+            "- 输出结构固定为两节：先 `## 人物清单`（一行一个角色，写清姓名与身份），"
+            "再逐个角色给出其完整提示词；然后 `## 场景清单`，再逐个场景给出其完整提示词。",
+            "- 每个角色必须有：主体段（含至少一条只有背面或侧面才看得到的特征）、固定尾缀、对应负面词。"
+            "同一批角色使用同一个版式、同一套尾缀，逐字一致。",
+            "- 每个场景标明类别（概念图 / 气氛图 / 名场面图），给出完整提示词与场景负面词；概念图里的人必须不可辨识。",
+        ]
+    lines += [
+        "- 每条提示词单独放在一个 ```text 代码块里，必须能整段复制，不留任何 `[方括号占位]`。",
+        "- 人名、地名一律用拼音或英文意译，不要把中文方块字写进画面描述。",
+        "- 不要输出「填写规则」「生成前引导流程」「交付前检查清单」「参数对照表」「常见失败与修法」等模板说明章节。",
+        "- 只输出 Markdown 正文，不要前言、结语、解释或自我检查过程。",
+    ]
+    return "\n".join(lines)
+
+
+def build_script_cast_user_prompt(script_content: str, only: str = ""):
+    target = "道具" if only == "prop" else "人物与场景"
+    return (
+        f"以下是剧本正文，请按系统提示词的规则提取其中的{target}，"
+        "输出可直接交给出图平台使用的完整提示词。\n\n"
+        "---- 剧本正文开始 ----\n"
+        f"{script_content}\n"
+        "---- 剧本正文结束 ----"
+    )
+
+
+class ScriptGenerateRequest(BaseModel):
+    provider: str = ""
+    model: str = ""
+    ms_model: str = ""
+    template_id: str = ""
+    template_text: str = ""
+    script: str = ""
+    notes: str = ""
+    characters: str = ""
+    allow_rewrite: bool = False
+
+
+class ScriptChatRequest(BaseModel):
+    """对话式补分镜：拿剧本正文 + 已有分镜清单 + 用户这句话，让模型只补新的分镜。"""
+
+    provider: str = ""
+    model: str = ""
+    ms_model: str = ""
+    template_id: str = ""
+    template_text: str = ""
+    script: str = ""
+    characters: str = ""
+    # 已有分镜的摘要（code / name），只为了告诉模型哪些内容已经拆过、不要重复
+    units: List[dict] = []
+    # 本次用户说的话
+    instruction: str = ""
+    # 之前的对话轮次：[{role, content}]，让「再短一点」这类追问能接着上下文
+    history: List[dict] = []
+
+
+class MediaCheckRequest(BaseModel):
+    """批量问一批成片地址还在不在磁盘上（分镜页用来找「状态成功但片子没了」的单元）。"""
+
+    urls: List[str] = []
+
+
+class ScriptCastRequest(BaseModel):
+    provider: str = ""
+    model: str = ""
+    ms_model: str = ""
+    template_id: str = ""
+    template_text: str = ""
+    script: str = ""
+    # 留空＝照旧一同提取人物与场景；"prop"＝只提取道具，人物与场景不动
+    kind: str = ""
+
+
+class ScriptTemplateSaveRequest(BaseModel):
+    name: str = ""
+    content: str = ""
+
+
+class ScriptSaveItemRequest(BaseModel):
+    name: str = "剧本提示词"
+    prompt: str = ""
+    scene: str = ""
+    category: str = "custom"
+
+
+class ScriptSaveRequest(BaseModel):
+    library_id: str = ""
+    items: List[ScriptSaveItemRequest] = []
+
+
+class ScriptMediaSaveRequest(BaseModel):
+    url: str = ""
+    name: str = ""
+    kind: str = "character"
+    library_id: str = ""
+
+
+class ScriptStoryboardSaveRequest(BaseModel):
+    name: str = ""
+    results: List[dict] = []
+    # 没有断点队列时前端存的是 null，不是空字典
+    session: Optional[dict] = None
+
+
+class ScriptProjectSaveRequest(BaseModel):
+    """一份剧本的整套工作区：正文、人物与场景、道具、分镜提示词、断点。"""
+    name: str = ""
+    script: str = ""
+    cast: str = ""
+    # 人物 / 场景 / 道具的提示词各存各的；cast 是三者合成的一份，留给老数据和其他读取方
+    cast_characters: str = ""
+    cast_scenes: str = ""
+    cast_props: str = ""
+    cast_state: dict = {}
+    results: List[dict] = []
+    session: Optional[dict] = None
+    # 只有页面上的「清空」按钮才置真：允许这次保存把已有的分镜整份清掉
+    allow_clear: bool = False
+
+
+class ScriptAssetLibraryRequest(BaseModel):
+    """给某个剧本建/取它自己的素材库，name 用于首次创建时给库命名。"""
+    name: str = ""
+
+
+@app.get("/api/script/templates")
+async def list_script_templates():
+    return {"templates": load_script_prompt_templates()}
+
+
+@app.post("/api/script/templates")
+async def save_script_template(payload: ScriptTemplateSaveRequest):
+    """把当前提示词存为常用；同名则覆盖。"""
+    name = re.sub(r"\s+", " ", str(payload.name or "").strip())[:60]
+    content = str(payload.content or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="请先填写提示词名称。")
+    if not content:
+        raise HTTPException(status_code=400, detail="提示词内容不能为空。")
+
+    items = load_script_user_templates()
+    saved = next((item for item in items if item["name"] == name), None)
+    if saved:
+        saved["content"] = content
+        saved["description"] = re.sub(r"\s+", " ", content).strip()[:140]
+    else:
+        saved = {
+            "id": f"user-{now_ms()}",
+            "name": name,
+            "description": re.sub(r"\s+", " ", content).strip()[:140],
+            "content": content,
+            "source": "user",
+        }
+        items.append(saved)
+    save_script_user_templates(items)
+    return {"template": saved, "templates": load_script_prompt_templates()}
+
+
+@app.get("/api/script/cast-templates")
+async def list_script_cast_templates():
+    return {"templates": load_script_cast_templates()}
+
+
+@app.post("/api/script/cast")
+async def generate_script_cast(payload: ScriptCastRequest):
+    """第一步：从剧本里提取人物与场景提示词，供后续分镜提示词沿用。
+
+    payload.kind = "prop" 时只提取道具，人物与场景原样不动。
+    """
+    script = str(payload.script or "").strip()
+    if not script:
+        raise HTTPException(status_code=400, detail="请先上传或粘贴剧本。")
+
+    only = "prop" if str(payload.kind or "").strip().lower() == "prop" else ""
+    template = str(payload.template_text or "").strip()
+    if not template:
+        template = (find_script_cast_template(payload.template_id) or {}).get("content") or ""
+    if not template.strip():
+        raise HTTPException(status_code=400, detail="未找到可用的人物与场景模板。")
+
+    chat_base, chat_headers, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
+    api_provider = get_api_provider(payload.provider or "")
+    system_prompt = build_script_cast_system_prompt(template, only)
+
+    async def stream():
+        yield sse_event({
+            "type": "meta",
+            "model": model,
+            "provider": api_provider.get("name") or api_provider.get("id"),
+        })
+        yield sse_event({"type": "cast_start", "kind": only or "character"})
+        async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
+            try:
+                response = await client.post(
+                    f"{chat_base}/chat/completions",
+                    headers=chat_headers,
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": build_script_cast_user_prompt(script, only)},
+                        ],
+                        "stream": False,
+                        "max_tokens": SCRIPT_GENERATE_MAX_TOKENS,
+                    },
+                )
+            except httpx.HTTPError as exc:
+                log_net_error("人物与场景提取", exc)
+                yield sse_event({"type": "cast_error", "detail": f"网络错误：{type(exc).__name__}: {exc}"})
+                yield sse_event({"type": "done"})
+                return
+            if response.status_code >= 400:
+                friendly = friendly_chat_error_detail(response.text, model, api_provider)
+                yield sse_event({
+                    "type": "cast_error",
+                    "detail": friendly or f"上游接口错误：{response.text[:500]}",
+                })
+                yield sse_event({"type": "done"})
+                return
+            try:
+                data = response.json()
+            except Exception:
+                yield sse_event({"type": "cast_error", "detail": "上游返回的不是合法 JSON。"})
+                yield sse_event({"type": "done"})
+                return
+            content = text_from_chat_response(data)
+            if not str(content or "").strip():
+                finish_reason = ((data.get("choices") or [{}])[0] or {}).get("finish_reason") or ""
+                detail = "模型没有返回内容，请重试或更换模型。"
+                if finish_reason == "length":
+                    detail = (
+                        f"模型输出被截断（已达 {SCRIPT_GENERATE_MAX_TOKENS} token 上限），思维链占满了额度。"
+                        "请提高 SCRIPT_GENERATE_MAX_TOKENS，或换用非推理模型。"
+                    )
+                yield sse_event({"type": "cast_error", "detail": detail})
+                yield sse_event({"type": "done"})
+                return
+            yield sse_event({
+                "type": "cast_done",
+                "content": content,
+                # 前端按这个决定写进哪个文本框：这次只出道具，就别碰人物/场景那两个框
+                "kind": only or "character",
+                "truncated": (((data.get("choices") or [{}])[0] or {}).get("finish_reason") == "length"),
+            })
+        yield sse_event({"type": "done"})
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.post("/api/script/generate")
+async def generate_script_prompts(payload: ScriptGenerateRequest, request: Request):
+    script = str(payload.script or "").strip()
+    if not script:
+        raise HTTPException(status_code=400, detail="请先上传或粘贴剧本。")
+
+    template = str(payload.template_text or "").strip()
+    if not template:
+        template = (find_script_prompt_template(payload.template_id) or {}).get("content") or ""
+    if not template.strip():
+        raise HTTPException(status_code=400, detail="未找到可用的默认提示词。")
+
+    chat_base, chat_headers, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
+    api_provider = get_api_provider(payload.provider or "")
+    characters = str(payload.characters or "").strip()
+    system_prompt = build_script_system_prompt(template, payload.allow_rewrite, payload.notes, characters)
+
+    async def stream():
+        yield sse_event({
+            "type": "meta",
+            "model": model,
+            "provider": api_provider.get("name") or api_provider.get("id"),
+        })
+        yield sse_event({"type": "episode_start", "index": 0})
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": build_script_user_prompt(script, characters)},
+        ]
+        content_parts = []
+        finish_reason = ""
+        async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
+            try:
+                # 逐 token 转发上游输出：前端边收边渲染，不用等整段写完才看到结果
+                async with client.stream(
+                    "POST",
+                    f"{chat_base}/chat/completions",
+                    headers=chat_headers,
+                    json={
+                        "model": model,
+                        "messages": messages,
+                        "stream": True,
+                        "max_tokens": SCRIPT_GENERATE_MAX_TOKENS,
+                    },
+                ) as response:
+                    if response.status_code >= 400:
+                        body = (await response.aread()).decode("utf-8", errors="ignore")
+                        friendly = friendly_chat_error_detail(body, model, api_provider)
+                        yield sse_event({
+                            "type": "episode_error",
+                            "index": 0,
+                            "detail": friendly or f"上游接口错误：{body[:500]}",
+                        })
+                        yield sse_event({"type": "done"})
+                        return
+                    async for line in response.aiter_lines():
+                        # 前端点「停止」会断开连接，这里立刻收手，别再等上游把剩下的吐完
+                        if await request.is_disconnected():
+                            return
+                        if not line:
+                            continue
+                        if line.startswith("data:"):
+                            line = line[5:].strip()
+                        if line == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(chunk, dict):
+                            continue
+                        choice = (chunk.get("choices") or [{}])[0] or {}
+                        if choice.get("finish_reason"):
+                            finish_reason = choice.get("finish_reason")
+                        piece = text_delta_from_chat_chunk(chunk)
+                        if not piece:
+                            # 少数中转服务会忽略 stream 参数，直接把整段结果当一条 JSON 回
+                            message = choice.get("message") or {}
+                            if isinstance(message.get("content"), str):
+                                piece = message.get("content")
+                        if piece:
+                            content_parts.append(piece)
+                            yield sse_event({"type": "delta", "index": 0, "text": piece})
+            except httpx.HTTPError as exc:
+                log_net_error("剧本分镜 生成", exc)
+                yield sse_event({
+                    "type": "episode_error",
+                    "index": 0,
+                    "detail": f"网络错误：{type(exc).__name__}: {exc}",
+                })
+                yield sse_event({"type": "done"})
+                return
+        content = "".join(content_parts)
+        if not str(content or "").strip():
+            # 推理模型（如 deepseek-flash）会把输出额度先花在思维链上，被截断时正文为空
+            detail = "模型没有返回内容，请重试或更换模型。"
+            if finish_reason == "length":
+                detail = (
+                    f"模型输出被截断（已达 {SCRIPT_GENERATE_MAX_TOKENS} token 上限），思维链占满了额度。"
+                    "请提高 SCRIPT_GENERATE_MAX_TOKENS，或换用非推理模型。"
+                )
+            yield sse_event({"type": "episode_error", "index": 0, "detail": detail})
+            yield sse_event({"type": "done"})
+            return
+        outline, units = parse_script_units(content)
+        yield sse_event({
+            "type": "episode_done",
+            "index": 0,
+            "raw": content,
+            "outline": outline,
+            "units": units,
+            "truncated": finish_reason == "length",
+        })
+        yield sse_event({"type": "done"})
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+# 对话式补分镜：用户在分镜页里跟模型对话，只补写新的分镜提示词。
+# 复用同一套模板与人物设定，输出格式和「开始生成分镜提示词」完全一致，
+# 前端拿到 units 后先预览，再由用户点某张卡片决定插到哪里。
+CHAT_HISTORY_MAX_TURNS = 8
+CHAT_HISTORY_MAX_CHARS = 6000
+
+
+@app.post("/api/script/chat-storyboard")
+async def chat_script_storyboard(payload: ScriptChatRequest, request: Request):
+    instruction = str(payload.instruction or "").strip()
+    if not instruction:
+        raise HTTPException(status_code=400, detail="请先说说要补什么样的分镜。")
+
+    template = str(payload.template_text or "").strip()
+    if not template:
+        template = (find_script_prompt_template(payload.template_id) or {}).get("content") or ""
+    if not template.strip():
+        raise HTTPException(status_code=400, detail="未找到可用的分镜提示词模板。")
+
+    chat_base, chat_headers, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
+    api_provider = get_api_provider(payload.provider or "")
+    characters = str(payload.characters or "").strip()
+    system_prompt = build_script_chat_system_prompt(template, characters)
+    user_prompt = build_script_chat_user_prompt(payload.script, payload.units, instruction)
+
+    messages = [{"role": "system", "content": system_prompt}]
+    # 带上前几轮对话，「再短一点」「换成夜戏」这类追问才接得上
+    for turn in (payload.history or [])[-CHAT_HISTORY_MAX_TURNS:]:
+        role = str((turn or {}).get("role") or "")
+        content = str((turn or {}).get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content[:CHAT_HISTORY_MAX_CHARS]})
+    messages.append({"role": "user", "content": user_prompt})
+
+    async def stream():
+        yield sse_event({
+            "type": "meta",
+            "model": model,
+            "provider": api_provider.get("name") or api_provider.get("id"),
+        })
+        content_parts = []
+        finish_reason = ""
+        async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
+            try:
+                async with client.stream(
+                    "POST",
+                    f"{chat_base}/chat/completions",
+                    headers=chat_headers,
+                    json={
+                        "model": model,
+                        "messages": messages,
+                        "stream": True,
+                        "max_tokens": SCRIPT_GENERATE_MAX_TOKENS,
+                    },
+                ) as response:
+                    if response.status_code >= 400:
+                        body = (await response.aread()).decode("utf-8", errors="ignore")
+                        friendly = friendly_chat_error_detail(body, model, api_provider)
+                        yield sse_event({
+                            "type": "chat_error",
+                            "detail": friendly or f"上游接口错误：{body[:500]}",
+                        })
+                        yield sse_event({"type": "done"})
+                        return
+                    async for line in response.aiter_lines():
+                        if await request.is_disconnected():
+                            return
+                        if not line:
+                            continue
+                        if line.startswith("data:"):
+                            line = line[5:].strip()
+                        if line == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(chunk, dict):
+                            continue
+                        choice = (chunk.get("choices") or [{}])[0] or {}
+                        if choice.get("finish_reason"):
+                            finish_reason = choice.get("finish_reason")
+                        piece = text_delta_from_chat_chunk(chunk)
+                        if not piece:
+                            message = choice.get("message") or {}
+                            if isinstance(message.get("content"), str):
+                                piece = message.get("content")
+                        if piece:
+                            content_parts.append(piece)
+                            yield sse_event({"type": "delta", "text": piece})
+            except httpx.HTTPError as exc:
+                log_net_error("剧本分镜 对话补分镜", exc)
+                yield sse_event({
+                    "type": "chat_error",
+                    "detail": f"网络错误：{type(exc).__name__}: {exc}",
+                })
+                yield sse_event({"type": "done"})
+                return
+        content = "".join(content_parts)
+        if not str(content or "").strip():
+            detail = "模型没有返回内容，请重试或更换模型。"
+            if finish_reason == "length":
+                detail = (
+                    f"模型输出被截断（已达 {SCRIPT_GENERATE_MAX_TOKENS} token 上限），思维链占满了额度。"
+                    "请提高 SCRIPT_GENERATE_MAX_TOKENS，或换用非推理模型。"
+                )
+            yield sse_event({"type": "chat_error", "detail": detail})
+            yield sse_event({"type": "done"})
+            return
+        outline, units = parse_script_units(content)
+        yield sse_event({
+            "type": "chat_done",
+            "raw": content,
+            "outline": outline,
+            "units": units,
+            "truncated": finish_reason == "length",
+        })
+        yield sse_event({"type": "done"})
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.post("/api/script/save-to-library")
+async def save_script_prompts_to_library(payload: ScriptSaveRequest):
+    items = [item for item in payload.items if str(item.prompt or "").strip()]
+    if not items:
+        raise HTTPException(status_code=400, detail="没有可保存的提示词。")
+    data = load_prompt_libraries()
+    library = find_prompt_library(data, payload.library_id)
+    if not library:
+        raise HTTPException(status_code=404, detail="提示词库不存在。")
+    created = []
+    for item in items:
+        record = normalize_prompt_library_item({
+            "id": f"tpl_{uuid.uuid4().hex[:12]}",
+            "name": item.name or "剧本提示词",
+            "category": normalize_prompt_category_id(item.category or "custom"),
+            "positive": item.prompt,
+            "scene": item.scene,
+            "created_at": now_ms(),
+            "updated_at": now_ms(),
+        })
+        library.setdefault("items", []).insert(0, record)
+        created.append(record)
+    data = save_prompt_libraries(data)
+    return {"library": public_prompt_libraries(data), "items": created}
+
+
+# 分镜提示词存到本机：浏览器那份 localStorage 一清就没了，这里把整份分镜落到本地文件，
+# 随时能加载回去。存的是分镜页的完整状态 —— results（各单元的提示词、成片记录、原始文案）
+# 加 session（断点队列），加载等于把页面恢复到保存那一刻。
+def load_script_storyboards():
+    if not os.path.exists(SCRIPT_STORYBOARD_PATH):
+        return {"items": []}
+    try:
+        with open(SCRIPT_STORYBOARD_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {"items": []}
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return {"items": []}
+    return data
+
+
+def save_script_storyboards(data):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(SCRIPT_STORYBOARD_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return data
+
+
+def script_storyboard_meta(item):
+    """列表里只回传够看的摘要，几百个单元的提示词不进列表接口。"""
+    units = [
+        unit
+        for result in (item.get("results") or [])
+        for unit in ((result or {}).get("units") or [])
+    ]
+    return {
+        "id": item.get("id") or "",
+        "name": item.get("name") or "分镜提示词",
+        "unit_count": len(units),
+        "with_runs": sum(1 for unit in units if unit.get("run")),
+        "saved_at": item.get("saved_at") or 0,
+    }
+
+
+def find_script_storyboard(data, storyboard_id):
+    return next((item for item in (data.get("items") or []) if item.get("id") == storyboard_id), None)
+
+
+@app.get("/api/script/storyboards")
+async def list_script_storyboards():
+    data = load_script_storyboards()
+    return {"items": [script_storyboard_meta(item) for item in data.get("items") or []]}
+
+
+@app.post("/api/script/storyboards")
+async def create_script_storyboard(payload: ScriptStoryboardSaveRequest):
+    results = [item for item in payload.results if isinstance(item, dict)]
+    if not results:
+        raise HTTPException(status_code=400, detail="还没有分镜提示词可以保存。")
+    data = load_script_storyboards()
+    item = {
+        "id": f"sb_{uuid.uuid4().hex[:12]}",
+        "name": str(payload.name or "").strip() or f"分镜提示词 {time.strftime('%Y-%m-%d %H:%M')}",
+        "saved_at": now_ms(),
+        "results": results,
+        "session": payload.session if isinstance(payload.session, dict) else {},
+    }
+    data.setdefault("items", []).insert(0, item)
+    save_script_storyboards(data)
+    return {"item": script_storyboard_meta(item)}
+
+
+@app.get("/api/script/storyboards/{storyboard_id}")
+async def get_script_storyboard(storyboard_id: str):
+    item = find_script_storyboard(load_script_storyboards(), storyboard_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="这份分镜提示词不存在。")
+    return {
+        "item": script_storyboard_meta(item),
+        "results": item.get("results") or [],
+        "session": item.get("session") or {},
+    }
+
+
+@app.delete("/api/script/storyboards/{storyboard_id}")
+async def delete_script_storyboard(storyboard_id: str):
+    data = load_script_storyboards()
+    items = data.get("items") or []
+    kept = [item for item in items if item.get("id") != storyboard_id]
+    if len(kept) == len(items):
+        raise HTTPException(status_code=404, detail="这份分镜提示词不存在。")
+    data["items"] = kept
+    save_script_storyboards(data)
+    return {"ok": True}
+
+
+# 剧本库：同时管多个剧本。一份剧本带一整套工作区（正文、人物与场景、分镜、断点），
+# 前端切换剧本时整套换掉，所以这里只按份读写，不掺和里面的分镜结构。
+def load_script_projects():
+    if not os.path.exists(SCRIPT_PROJECT_PATH):
+        return {"items": []}
+    try:
+        with open(SCRIPT_PROJECT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {"items": []}
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return {"items": []}
+    return data
+
+
+def save_script_projects(data):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    # 正文加几百个分镜能到几 MB，先写临时文件再改名：免得写到一半被读到半个 JSON
+    tmp_path = SCRIPT_PROJECT_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, SCRIPT_PROJECT_PATH)
+    return data
+
+
+def script_project_units(item):
+    return [
+        unit
+        for result in (item.get("results") or [])
+        for unit in ((result or {}).get("units") or [])
+    ]
+
+
+def script_project_meta(item):
+    """列表只回传够挑剧本的摘要，正文和几百个分镜不进列表接口。"""
+    units = script_project_units(item)
+    return {
+        "id": item.get("id") or "",
+        "name": item.get("name") or "未命名剧本",
+        "char_count": len(str(item.get("script") or "")),
+        "unit_count": len(units),
+        "done_count": sum(1 for unit in units if ((unit.get("run") or {}).get("status")) == "succeeded"),
+        "updated_at": item.get("updated_at") or 0,
+    }
+
+
+def find_script_project(data, project_id):
+    return next((item for item in (data.get("items") or []) if item.get("id") == project_id), None)
+
+
+def script_project_unit_count(results):
+    """一份 results 里总共装了多少个分镜单元。"""
+    total = 0
+    for row in results or []:
+        if isinstance(row, dict):
+            total += len(row.get("units") or [])
+    return total
+
+
+def write_script_project(item, payload):
+    """把前端送来的一整套工作区盖到这条剧本上。"""
+    name = str(payload.name or "").strip()[:60]
+    if name:
+        item["name"] = name
+    item.setdefault("name", "未命名剧本")
+    item["script"] = str(payload.script or "")
+    item["cast_characters"] = str(payload.cast_characters or "")
+    item["cast_scenes"] = str(payload.cast_scenes or "")
+    item["cast_props"] = str(payload.cast_props or "")
+    combined = [part.strip() for part in (item["cast_characters"], item["cast_scenes"], item["cast_props"]) if part.strip()]
+    item["cast"] = str(payload.cast or "") or "\n\n".join(combined)
+    item["cast_state"] = payload.cast_state if isinstance(payload.cast_state, dict) else {}
+    item["results"] = [row for row in payload.results if isinstance(row, dict)]
+    item["session"] = payload.session if isinstance(payload.session, dict) else None
+    item["updated_at"] = now_ms()
+    return item
+
+
+# ---------- 剧本文件导出 ----------
+# 每个剧本除了 data/*.json 里的那份数据，还会自动把「原剧本 / 人物提示词 / 场景提示词 / 分镜提示词」
+# 以及它自己的素材库、剧本数据写成文件，放进它素材库那个文件夹（assets/library/<剧本名>/），
+# 一个文件夹装齐整个剧本。data/*.json 仍是程序的主存储，这里只是可读的副本。
+
+CAST_SECTION_HEADING_RE = re.compile(r"^#{2}\s*(.+?)\s*$")
+
+
+def split_cast_text(text):
+    """老剧本把人物、场景、道具挤在同一段 Markdown 里，按二级标题切回三份。"""
+    buckets = {"character": [], "scene": [], "prop": []}
+    kind = ""
+    for line in str(text or "").split("\n"):
+        heading = CAST_SECTION_HEADING_RE.match(line)
+        if heading:
+            title = heading.group(1)
+            # 道具要排在场景前面判：「道具清单」里没有场景/人物字样，但顺序写死更不容易出错
+            if re.search(r"道具|物件|prop", title, re.I):
+                kind = "prop"
+            elif re.search(r"场景|环境|scene", title, re.I):
+                kind = "scene"
+            elif re.search(r"人物|角色|character|cast", title, re.I):
+                kind = "character"
+        if kind:
+            buckets[kind].append(line)
+    return {
+        "character": "\n".join(buckets["character"]).strip(),
+        "scene": "\n".join(buckets["scene"]).strip(),
+        "prop": "\n".join(buckets["prop"]).strip(),
+    }
+
+
+def script_project_storyboard_markdown(item):
+    """分镜提示词：按「### P01｜时长｜名字 + 提示词」排下来，和页面里导出 Markdown 一致。"""
+    lines = []
+    for result in item.get("results") or []:
+        for unit in (result or {}).get("units") or []:
+            if not isinstance(unit, dict):
+                continue
+            subtitle = "｜".join(part for part in (unit.get("duration"), unit.get("name")) if part)
+            lines.append(f"### {unit.get('code') or ''}{'｜' + subtitle if subtitle else ''}")
+            lines.append("")
+            lines.append(str(unit.get("prompt") or unit.get("raw") or "").strip())
+            lines.append("")
+    return "\n".join(lines).strip()
+
+
+def script_library_root_dir(library) -> str:
+    """素材库在磁盘上的顶层文件夹（取分组目录的第一段，改过名也还对得上）。"""
+    for cat in library.get("categories") or []:
+        dirname = str(cat.get("dir") or "").strip("/")
+        if dirname:
+            return dirname.split("/")[0]
+    return asset_library_root_name(library)
+
+
+def write_if_changed(path, text, binary=False):
+    """内容没变就不写盘：剧本动辄几 MB，每次自动保存都重写太浪费。"""
+    data = text if binary else str(text)
+    try:
+        if os.path.isfile(path):
+            mode = "rb" if binary else "r"
+            with open(path, mode, **({} if binary else {"encoding": "utf-8"})) as f:
+                if f.read() == data:
+                    return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        mode = "wb" if binary else "w"
+        with open(path, mode, **({} if binary else {"encoding": "utf-8"})) as f:
+            f.write(data)
+    except Exception as exc:
+        print(f"剧本文件导出失败（{os.path.basename(path)}）: {exc}")
+
+
+def export_script_project_files(item, lib=None):
+    """把一份剧本的内容写成文件，放进它素材库那个文件夹。"""
+    try:
+        lib = lib if lib is not None else load_asset_library()
+        library = next(
+            (row for row in (lib.get("libraries") or []) if row.get("id") == item.get("asset_library_id")),
+            None,
+        )
+        if not library:
+            return
+        target = os.path.join(ASSET_LIBRARY_DIR, *script_library_root_dir(library).split("/"))
+        characters = str(item.get("cast_characters") or "")
+        scenes = str(item.get("cast_scenes") or "")
+        props = str(item.get("cast_props") or "")
+        if not characters and not scenes and not props and item.get("cast"):
+            parts = split_cast_text(item.get("cast"))
+            characters, scenes, props = parts["character"], parts["scene"], parts["prop"]
+        texts = {
+            "原剧本.txt": item.get("script") or "",
+            "人物提示词.md": characters,
+            "场景提示词.md": scenes,
+            "道具提示词.md": props,
+            "分镜提示词.md": script_project_storyboard_markdown(item),
+        }
+        for filename, text in texts.items():
+            write_if_changed(os.path.join(target, filename), text)
+        write_if_changed(
+            os.path.join(target, "asset_library.json"),
+            json.dumps({"libraries": [library]}, ensure_ascii=False, indent=2),
+        )
+        write_if_changed(
+            os.path.join(target, "script_projects.json"),
+            json.dumps({"items": [item]}, ensure_ascii=False, indent=2),
+        )
+        # API 平台配置也存一份副本（原样复制，含 Key）。这个文件不会通过 /assets 被读走，
+        # 见 protect_script_config_in_assets。
+        try:
+            with open(API_PROVIDERS_FILE, "rb") as f:
+                write_if_changed(os.path.join(target, "api_providers.json"), f.read(), binary=True)
+        except Exception as exc:
+            print(f"剧本文件导出失败（api_providers.json）: {exc}")
+    except Exception as exc:
+        print(f"剧本文件导出失败: {exc}")
+
+
+@app.get("/api/script/projects")
+async def list_script_projects():
+    data = load_script_projects()
+    # 最近改过的排前面，下拉框里顺手就是手上这个
+    items = sorted(data.get("items") or [], key=lambda row: row.get("updated_at") or 0, reverse=True)
+    return {"items": [script_project_meta(item) for item in items]}
+
+
+@app.post("/api/script/projects")
+async def create_script_project(payload: ScriptProjectSaveRequest):
+    data = load_script_projects()
+    item = {"id": f"sp_{uuid.uuid4().hex[:12]}", "created_at": now_ms()}
+    item["name"] = str(payload.name or "").strip()[:60] or f"剧本 {time.strftime('%m-%d %H:%M')}"
+    write_script_project(item, payload)
+    data.setdefault("items", []).append(item)
+    save_script_projects(data)
+    export_script_project_files(item)
+    return {"item": script_project_meta(item)}
+
+
+@app.get("/api/script/projects/{project_id}")
+async def get_script_project(project_id: str):
+    item = find_script_project(load_script_projects(), project_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="这个剧本不存在。")
+    return {
+        "item": script_project_meta(item),
+        "script": item.get("script") or "",
+        "cast": item.get("cast") or "",
+        "cast_characters": item.get("cast_characters") or "",
+        "cast_scenes": item.get("cast_scenes") or "",
+        "cast_props": item.get("cast_props") or "",
+        "cast_state": item.get("cast_state") or {},
+        "results": item.get("results") or [],
+        "session": item.get("session"),
+    }
+
+
+@app.put("/api/script/projects/{project_id}")
+async def save_script_project(project_id: str, payload: ScriptProjectSaveRequest):
+    """自动保存走这里：整份覆盖这一条，不动文件里别的剧本。"""
+    data = load_script_projects()
+    item = find_script_project(data, project_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="这个剧本不存在。")
+    # 防「整份清空」：还开着的旧页面内存里可能是空的分镜，自动保存一写就把别处
+    # 生成好的分镜全抹掉。真要清空得走页面上的「清空」按钮（那次会带 allow_clear）。
+    stored_units = script_project_unit_count(item.get("results"))
+    incoming_units = script_project_unit_count(payload.results)
+    if stored_units and not incoming_units and not payload.allow_clear:
+        raise HTTPException(
+            status_code=409,
+            detail=f"这次保存会把剧本里已有的 {stored_units} 条分镜整份清空，已拒绝。"
+                   f"如果确实要清空，请点页面上的「清空」按钮。",
+        )
+    write_script_project(item, payload)
+    save_script_projects(data)
+    # 顺手把这份剧本的正文 / 人物场景提示词 / 分镜提示词导成文件，放进它素材库那个文件夹
+    export_script_project_files(item)
+    return {"item": script_project_meta(item)}
+
+
+@app.delete("/api/script/projects/{project_id}")
+async def delete_script_project(project_id: str):
+    data = load_script_projects()
+    items = data.get("items") or []
+    kept = [item for item in items if item.get("id") != project_id]
+    if len(kept) == len(items):
+        raise HTTPException(status_code=404, detail="这个剧本不存在。")
+    data["items"] = kept
+    save_script_projects(data)
+    return {"ok": True}
+
+
+@app.post("/api/script/projects/{project_id}/asset-library")
+async def ensure_script_asset_library(project_id: str, payload: ScriptAssetLibraryRequest):
+    """一个剧本一套自己的素材库。
+
+    首次调用时按剧本名建库，并在库里补上 角色 / 场景 / 生成图片 / 生成视频 四个分组
+    （各自对应磁盘上一个独立文件夹）；库 id 记在剧本上，之后切换回这个剧本直接复用，
+    人物图、场景图和分镜成片就不会再和别的戏混在同一个分组里。
+    """
+    data = load_script_projects()
+    project = find_script_project(data, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="这个剧本不存在。")
+    name = str(payload.name or "").strip()[:60]
+    if name:
+        project["name"] = name
+    lib = load_asset_library()
+    library_id = str(project.get("asset_library_id") or "")
+    library = next(
+        (row for row in (lib.get("libraries") or []) if row.get("id") == library_id),
+        None,
+    ) if library_id else None
+    if not library:
+        library = {
+            "id": f"lib_{uuid.uuid4().hex[:12]}",
+            "name": sanitize_asset_name(project.get("name") or "剧本素材库", "剧本素材库"),
+            "type": "asset",
+            "categories": [],
+        }
+        lib.setdefault("libraries", []).append(library)
+    categories = library.setdefault("categories", [])
+    assigned = {}
+    for kind in SCRIPT_MEDIA_LIBRARY_ORDER:
+        category_name = SCRIPT_MEDIA_LIBRARY_CATEGORY[kind][1]
+        cat = find_script_library_category(library, category_name)
+        if not cat:
+            cat = {"id": f"cat_{uuid.uuid4().hex[:12]}", "name": category_name, "type": "image", "items": []}
+            cat["dir"] = unique_library_category_dir(library, category_name)
+            try:
+                os.makedirs(os.path.join(ASSET_LIBRARY_DIR, cat["dir"]), exist_ok=True)
+            except Exception as exc:
+                print(f"创建剧本分组文件夹失败: {exc}")
+            categories.append(cat)
+        assigned[kind] = cat.get("id")
+    project["asset_library_id"] = library["id"]
+    # 剧本改过名就跟着改库名，方便在素材库面板里认出来（磁盘上的分组文件夹不动）
+    if name:
+        library["name"] = sanitize_asset_name(name, library.get("name") or "剧本素材库")
+    save_asset_library(lib)
+    save_script_projects(data)
+    # 切进这个剧本时顺手刷一遍它的文件（正文 / 提示词 / 素材库副本）
+    export_script_project_files(project, lib)
+    return {
+        "library_id": library["id"],
+        "name": library.get("name") or "",
+        "categories": assigned,
+    }
+
+
+# 剧本里生成的参考图（人物 / 场景）和分镜跑出来的成片，出片后自动进素材库：
+# 人物归「角色」、场景归「场景」、道具归「道具」、分镜视频归「生成视频」、分镜静帧归「生成图片」。
+SCRIPT_MEDIA_LIBRARY_CATEGORY = {
+    "character": ("characters", "角色"),
+    "scene": ("scenes", "场景"),
+    "prop": ("props", "道具"),
+    "video": ("cat_08c2fda527c1", "生成视频"),
+    "image": ("cat_ebe3e00310c1", "生成图片"),
+}
+# 剧本素材库里五个分组按这个顺序建：角色 / 场景 / 道具 / 生成图片 / 生成视频
+SCRIPT_MEDIA_LIBRARY_ORDER = ("character", "scene", "prop", "image", "video")
+
+
+def find_script_library_category(library, category_name):
+    """在一个素材库里按分组名找图片分组（剧本库的分组 id 是新建的，认名字最稳）。"""
+    return next(
+        (
+            cat for cat in (library.get("categories") or [])
+            if cat.get("type") == "image" and category_name in str(cat.get("name") or "")
+        ),
+        None,
+    )
+
+
+@app.post("/api/script/save-media-to-library")
+async def save_script_media_to_library(payload: ScriptMediaSaveRequest):
+    src = output_file_from_url(payload.url)
+    if not src:
+        raise HTTPException(status_code=400, detail="只支持保存本地 /assets 或 /output 媒体")
+    category_id, category_name = SCRIPT_MEDIA_LIBRARY_CATEGORY.get(
+        payload.kind, SCRIPT_MEDIA_LIBRARY_CATEGORY["character"]
+    )
+    lib = load_asset_library()
+    library = find_asset_library(lib, payload.library_id)
+    if not library:
+        raise HTTPException(status_code=404, detail="资产库不存在")
+    categories = library.setdefault("categories", [])
+    # 分组被改名或删掉时，先按名字找同类的图片分组，都没有再补一个回来
+    cat = next((c for c in categories if c.get("id") == category_id), None) or find_script_library_category(
+        library, category_name
+    )
+    if not cat:
+        # 剧本各自的素材库：分组是新建的，磁盘上给它一个带库名的独立文件夹，
+        # 不同剧本的同名分组不会把文件堆到同一个目录里。
+        cat = {"id": f"cat_{uuid.uuid4().hex[:12]}", "name": category_name, "type": "image", "items": []}
+        if payload.library_id:
+            cat["dir"] = unique_library_category_dir(library, category_name)
+            try:
+                os.makedirs(os.path.join(ASSET_LIBRARY_DIR, cat["dir"]), exist_ok=True)
+            except Exception as exc:
+                print(f"创建剧本分组文件夹失败: {exc}")
+        else:
+            # 老库（默认资产库）沿用原来的固定分组 id，保持既有行为
+            cat["id"] = category_id
+        categories.append(cat)
+    if cat.get("type") != "image":
+        raise HTTPException(status_code=400, detail="目标分组不是图片分组")
+    # 再按落地的文件校一次类型：视频不会被塞进图片分组
+    cat = route_media_category(library, cat, src)
+    _, item = make_asset_library_item(src, payload.name or os.path.basename(src), subdir=cat.get("dir") or "")
+    cat.setdefault("items", []).append(item)
+    save_asset_library(lib)
+    return {"item": item, "category_id": cat.get("id"), "library_id": library.get("id")}
+
+
+@app.get("/api/script/library-videos")
+async def list_script_library_videos(library_id: str = ""):
+    """素材库「生成视频」分组里已有的成片。
+
+    分镜页拿它按名字（条目名开头就是 P01 这类分镜编号）认领回去，
+    已经出过片的分镜就不必再跑一遍。传 library_id 就只看那个剧本自己的素材库。
+    """
+    lib = load_asset_library()
+    library = find_asset_library(lib, library_id)
+    category_id, category_name = SCRIPT_MEDIA_LIBRARY_CATEGORY["video"]
+    categories = (library or {}).get("categories", []) or []
+    cat = next((c for c in categories if c.get("id") == category_id), None)
+    # 跟入库时一样：分组被改名或删掉过，就按名字找回同类的那个
+    if not cat:
+        cat = find_script_library_category(library, category_name)
+    items = []
+    for item in (cat or {}).get("items", []) or []:
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        items.append({
+            "name": item.get("name") or "",
+            "url": url,
+            "created_at": item.get("created_at") or 0,
+        })
+    return {"items": items}
+
+
+MEDIA_CHECK_MAX_URLS = 2000
+
+
+@app.post("/api/script/check-media")
+async def check_script_media_present(payload: MediaCheckRequest):
+    """给一批成片地址，回哪些文件其实已经不在磁盘上了。
+
+    分镜的成片会被手动移走或删掉，可单元里的 run.status 还是 succeeded，
+    「生成全部分镜」就会把它当成已出片跳过、再也不重跑。前端拿这份结果
+    把「状态成功但片子没了」的分镜挑回来重跑。
+    """
+    missing = []
+    for raw in (payload.urls or [])[:MEDIA_CHECK_MAX_URLS]:
+        url = str(raw or "").strip()
+        if not url:
+            continue
+        # 只校验本地路径；外链没法 stat，别因为查不到就把人家判成丢了
+        if not url.startswith(("/assets/", "/output/", "/api/storage-files/")):
+            continue
+        if not output_file_from_url(url):
+            missing.append(url)
+    return {"missing": missing}
+
+
 @app.post("/api/asset-library/libraries")
 async def create_asset_library(payload: AssetLibraryRequest):
     lib = load_asset_library()
     library = {"id": f"lib_{uuid.uuid4().hex[:12]}", "name": sanitize_asset_name(payload.name, "资产库"), "type": "asset", "categories": []}
-    library["categories"].append({"id": f"cat_{uuid.uuid4().hex[:12]}", "name": "默认分组", "type": "image", "items": []})
+    default_dir = unique_library_category_dir(library, "默认分组")
+    library["categories"].append({"id": f"cat_{uuid.uuid4().hex[:12]}", "name": "默认分组", "type": "image", "dir": default_dir, "items": []})
+    try:
+        os.makedirs(os.path.join(ASSET_LIBRARY_DIR, default_dir), exist_ok=True)
+    except Exception as exc:
+        print(f"创建分组文件夹失败: {exc}")
     library["categories"].append({"id": f"wf_{uuid.uuid4().hex[:12]}", "name": "工作流", "type": "workflow", "items": []})
     lib.setdefault("libraries", []).append(library)
     lib["active_library_id"] = library["id"]
@@ -16946,8 +19026,9 @@ async def create_asset_library_category(payload: AssetLibraryCategoryRequest):
     cat_type = "workflow" if str(payload.type or "").lower() == "workflow" else "image"
     category = {"id": f"cat_{uuid.uuid4().hex[:12]}", "name": sanitize_asset_name(payload.name, "新文件夹"), "type": cat_type, "items": []}
     if cat_type == "image":
-        # 图片分组在 library/ 下建一个真实文件夹，之后该分组的资产都存进这个文件夹，便于在磁盘上管理。
-        category["dir"] = unique_asset_category_dir(library, payload.name)
+        # 图片分组在 library/<库名>/ 下建一个真实文件夹，之后该分组的资产都存进这个文件夹，
+        # 便于在磁盘上分辨素材属于哪个库、哪一类。
+        category["dir"] = unique_library_category_dir(library, category["name"])
         try:
             os.makedirs(os.path.join(ASSET_LIBRARY_DIR, category["dir"]), exist_ok=True)
         except Exception as exc:
@@ -17001,11 +19082,16 @@ async def add_asset_library_item(payload: AssetLibraryAddRequest):
     src = output_file_from_url(payload.url)
     if not src:
         raise HTTPException(status_code=400, detail="只支持保存本地 /assets 或 /output 媒体")
+    library = find_asset_library(lib, payload.library_id)
+    # 归类两级：先按文件本身的类型（视频 / 图片），再按图片内容细分（角色 / 场景 / 生成图片）
+    cat = route_media_category(library, cat, src)
+    classification = None
+    if asset_library_media_kind(src) == "image":
+        classification = await classify_asset_image_best_effort(src, prompt=ASSET_GROUP_ROUTING_INSTRUCTION)
+        cat = route_media_category_by_content(library, cat, classification)
     _, item = make_asset_library_item(src, payload.name or os.path.basename(src), subdir=cat.get("dir") or "")
-    if item.get("kind") == "image":
-        classification = await classify_asset_image_best_effort(output_file_from_url(item.get("url") or "") or src)
-        if classification:
-            item["classification"] = classification
+    if classification:
+        item["classification"] = classification
     cat.setdefault("items", []).append(item)
     save_asset_library(lib)
     return {"library": lib, "item": item}
@@ -17025,12 +19111,17 @@ async def batch_add_asset_library_items(payload: AssetLibraryBatchAddRequest):
         src = output_file_from_url(entry.url)
         if not src:
             continue
-        _, item = make_asset_library_item(src, entry.name or os.path.basename(src), subdir=cat.get("dir") or "")
-        if item.get("kind") == "image":
-            classification = await classify_asset_image_best_effort(output_file_from_url(item.get("url") or "") or src)
-            if classification:
-                item["classification"] = classification
-        cat.setdefault("items", []).append(item)
+        library = find_asset_library(lib, payload.library_id)
+        # 一条一批里可能既有图片又有视频：先按文件类型归位，再按图片内容细分
+        target = route_media_category(library, cat, src)
+        classification = None
+        if asset_library_media_kind(src) == "image":
+            classification = await classify_asset_image_best_effort(src, prompt=ASSET_GROUP_ROUTING_INSTRUCTION)
+            target = route_media_category_by_content(library, target, classification)
+        _, item = make_asset_library_item(src, entry.name or os.path.basename(src), subdir=target.get("dir") or "")
+        if classification:
+            item["classification"] = classification
+        target.setdefault("items", []).append(item)
         added.append(item)
     save_asset_library(lib)
     return {"library": lib, "items": added}
@@ -18353,13 +20444,13 @@ def generate(req: GenerateRequest):
     try:
         required_images = collect_required_comfy_media(req.params)
 
-        target_backend = reserve_best_backend(required_images)
+        target_backend = reserve_best_backend()
 
         for image_name in required_images:
             need_sync = False
             try:
-                check_url = f"http://{target_backend}/view?filename={urllib.parse.quote(image_name)}&type=input"
-                resp = requests.get(check_url, stream=True, timeout=0.5)
+                check_url = f"{comfy_base_url(target_backend)}/view?filename={urllib.parse.quote(image_name)}&type=input"
+                resp = requests.get(check_url, stream=True, timeout=0.5, proxies=COMFYUI_NO_PROXY)
                 resp.close()
                 if resp.status_code != 200:
                     need_sync = True
@@ -18372,8 +20463,8 @@ def generate(req: GenerateRequest):
                 for addr in COMFYUI_INSTANCES:
                     if addr == target_backend: continue
                     try:
-                        src_url = f"http://{addr}/view?filename={urllib.parse.quote(image_name)}&type=input"
-                        r = requests.get(src_url, timeout=5)
+                        src_url = f"{comfy_base_url(addr)}/view?filename={urllib.parse.quote(image_name)}&type=input"
+                        r = requests.get(src_url, timeout=5, proxies=COMFYUI_NO_PROXY)
                         if r.status_code == 200:
                             image_content = r.content
                             image_type = r.headers.get("Content-Type", "image/png")
@@ -18383,7 +20474,8 @@ def generate(req: GenerateRequest):
                 if image_content:
                     try:
                         files = {'image': (image_name, image_content, image_type)}
-                        requests.post(f"http://{target_backend}/upload/image", files=files, timeout=10)
+                        requests.post(f"{comfy_base_url(target_backend)}/upload/image", files=files,
+                                      timeout=COMFYUI_UPLOAD_TIMEOUT, proxies=COMFYUI_NO_PROXY)
                     except Exception as e:
                         print(f"Sync upload failed: {e}")
 
@@ -18398,14 +20490,20 @@ def generate(req: GenerateRequest):
 
         # config 里映射的「输出图像」节点：命中时把它的结果排在输出列表前面，
         # 避免工作流里存在多个输出节点时，接口返回的第一张图不是用户映射的那张。
+        # output_only 为真时更进一步：只保留该节点的结果，丢弃工作流里顺带保存的其他文件
+        # （例如 QWEN-IMAGE2.1 里那张未放大的原图）。
         output_node = ""
+        output_only = False
         try:
             cfg_file = workflow_config_path(req.workflow_json)
             if os.path.exists(cfg_file):
                 with open(cfg_file, "r", encoding="utf-8") as f:
-                    output_node = str((json.load(f) or {}).get("output_node") or "")
+                    cfg_data = json.load(f) or {}
+                output_node = str(cfg_data.get("output_node") or "")
+                output_only = bool(cfg_data.get("output_only"))
         except Exception:
             output_node = ""
+            output_only = False
 
         seed = random.randint(1, 4294967295)
 
@@ -18443,44 +20541,23 @@ def generate(req: GenerateRequest):
                     "_meta": node_inputs.get("_meta") if isinstance(node_inputs.get("_meta"), dict) else {"title": str(node_inputs.get("class_type"))},
                 }
 
+        # 分镜写的时长要按这张卡的显存收口：多台混配时前端不知道会落到谁身上
+        apply_unit_duration(workflow, req.duration_param, target_backend)
+
         p = {"prompt": workflow, "client_id": CLIENT_ID}
         print(f"[comfyui] 提交渲染 backend={target_backend} workflow={req.workflow_json} type={req.type} params={runtime_log_params_summary(req.params)}", flush=True)
-        prompt_id = comfy_submit_prompt(target_backend, p)
+        prompt_id = comfy_submit_prompt(target_backend, p, req.comfy_free_memory)
         print(f"[comfyui] 已进入队列 prompt_id={prompt_id}", flush=True)
 
-        history_data = None
-        wait_started = time.time()
-        last_beat = wait_started
-        last_queue_state = ""
-        missing_checks = 0
-        for i in range(COMFYUI_HISTORY_TIMEOUT):
-            try:
-                res = get_comfy_history(target_backend, prompt_id)
-                if prompt_id in res:
-                    history_data = res[prompt_id]
-                    break
-            except Exception:
-                pass
-            queue_state = comfy_prompt_queue_state(target_backend, prompt_id)
-            if queue_state:
-                missing_checks = 0
-                last_queue_state = queue_state
-            elif queue_state == "":
-                # 历史和队列里都找不到该任务：ComfyUI 重启/任务被清掉时就是这样，
-                # 连续几次仍找不到就判定任务丢失，避免一直空等到超时。
-                missing_checks += 1
-                if missing_checks >= 3:
-                    print(f"[comfyui] 任务丢失 prompt_id={prompt_id}：ComfyUI 队列与历史中都没有该任务（服务重启或被清除）", flush=True)
-                    raise Exception("ComfyUI 任务已丢失（服务重启或被清除），未拿到渲染结果")
-            now = time.time()
-            if now - last_beat >= 10:
-                last_beat = now
-                print(f"[comfyui] 渲染中 prompt_id={prompt_id} 已等待 {int(now - wait_started)}s 队列={last_queue_state or '查询中'}", flush=True)
-            time.sleep(1)
-
-        if not history_data:
-            print(f"[comfyui] 渲染超时 prompt_id={prompt_id} 已等待 {int(time.time() - wait_started)}s（上限 {COMFYUI_HISTORY_TIMEOUT}s）", flush=True)
-            raise Exception("ComfyUI 渲染超时")
+        # 订阅 ComfyUI 实时进度，并把进度写进画布任务，前端 output 节点可以边渲染边看进度
+        progress_ctx = begin_canvas_comfy_progress(target_backend, prompt_id)
+        try:
+            history_data = comfy_wait_for_history(
+                target_backend, prompt_id,
+                on_tick=lambda queue_state, waited: publish_canvas_comfy_progress(progress_ctx, prompt_id, queue_state, waited),
+            )
+        finally:
+            stop_comfy_progress_watch(prompt_id)
 
         # ComfyUI 可能「执行完成但失败」（例如 CUDA OOM）：此时 history 里 outputs 为空、
         # status.status_str == 'error'。必须把节点报错抛出来，否则前端只会看到"成功但没结果"。
@@ -18513,6 +20590,13 @@ def generate(req: GenerateRequest):
                     file_candidates.append((node_id, class_type, output_key, item, comfy_output_kind(item)))
                 for text, name in comfy_text_values_from_output(node_output):
                     text_candidates.append((node_id, class_type, text, name))
+
+            # 声明了 output_only 时只保留映射节点的产出；该节点没产出任何文件时才退回全量，
+            # 避免工作流改动后拿不到结果。
+            if output_node and output_only:
+                mapped_candidates = [item for item in file_candidates if str(item[0]) == output_node]
+                if mapped_candidates:
+                    file_candidates = mapped_candidates
 
             # 只要存在“非预览节点”产出的图片，就把 PreviewImage/对比节点的图片视为冗余丢弃；
             # 若整个工作流只有预览图（没有 SaveImage 等），则保留预览图作为唯一结果，避免零输出。
@@ -18632,8 +20716,14 @@ class WorkflowField(BaseModel):
     # （COMFY_AUTOGROW_V3，如 ref_images / ref_audios），上限 max_items。
     multi: bool = False
     max_items: Optional[int] = None
+    # 参考图上传前按最长边等比压缩的像素上限（0/None = 不压缩）：远端显存有限时，
+    # 大参考图会明显抬高注意力/VAE 的显存峰值，工作流可在这里钉一个上限。
+    max_side: Optional[int] = None
     # 动态多输入的键前缀（默认按 input 名推测：ref_images -> ref_image_）
     prefix: str = ""
+    # 一组媒体需要同时注入多个目标节点时用（例如 MINIMAX-H3 的 LOW/HIGH 两段
+    # conditioning 都要吃同一组 ref_images）；为空时只写 node。
+    nodes: List[str] = []
 
 class WorkflowConfig(BaseModel):
     title: str = ""
@@ -19084,28 +21174,74 @@ def runninghub_collect_workflow_fields(workflow_json):
 class ComfyInstancesPayload(BaseModel):
     instances: List[str] = []
 
+class ComfyInstancesStatusPayload(BaseModel):
+    instances: List[str] = []
+
 @app.get("/api/comfyui/instances")
 def get_comfyui_instances():
     return {"instances": COMFYUI_INSTANCES}
 
+@app.post("/api/comfyui/instances/status")
+def check_comfyui_instances_status(payload: ComfyInstancesStatusPayload):
+    """逐台探一次连通性和队列长度，设置页的「检测连接」和定时检测都走这里。
+
+    前端把输入框里当前的地址整份发过来，所以还没保存的地址也能先测一遍（先测再存）。
+    探活要等网络，几台并发探，不串着等。
+    """
+    rows = []
+    pending = []
+    for item in payload.instances:
+        raw = str(item or "").strip()
+        if not raw:
+            continue
+        index = len(rows)
+        rows.append(None)
+        normalized = normalize_comfy_instance(raw)
+        if normalized:
+            pending.append((index, normalized))
+        else:
+            rows[index] = {"backend": raw, "ok": False, "running": 0, "pending": 0,
+                           "error": "地址格式不对，应为 host:port 或 WaaS 域名"}
+    if pending:
+        with ThreadPoolExecutor(max_workers=len(pending)) as pool:
+            probed = pool.map(comfy_queue_snapshot, [addr for _, addr in pending])
+            for (index, _), row in zip(pending, probed):
+                rows[index] = row
+    return {"items": rows}
+
+@app.get("/api/comfyui/limits")
+def get_comfyui_limits():
+    """各台主机按显存能跑多长（24G 卡 10 秒 / 32G 卡 15 秒），用来看配置。
+
+    真正夹时长的地方在 generate()：分镜动态分配，落到哪台由后端定，提交前按那台收口。
+    """
+    backends = comfy_all_unit_seconds_limits()
+    if not backends:
+        return {"backend": COMFYUI_ADDRESS, "vram_total": 0, "vram_gb": 0,
+                "max_duration_seconds": 10, "backends": []}
+    return {
+        **backends[0],
+        # 各台里最长的那档：分镜有可能落到最宽的那台上
+        "max_duration_seconds": max(item["max_duration_seconds"] for item in backends),
+        "backends": backends,
+    }
+
 @app.put("/api/comfyui/instances")
 def save_comfyui_instances(payload: ComfyInstancesPayload):
-    # 宽容校验：去前后空白、去 http(s):// 前缀、去尾部斜杠；要求形如 host:port
+    # 去前后空白、去尾部斜杠，统一存成完整 URL：
+    # 自建直连填 host:port（走 http），WaaS 实例只填域名即可（按 https 443 处理）
     cleaned = []
     for item in payload.instances:
-        s = str(item or "").strip()
-        if not s:
+        normalized = normalize_comfy_instance(item)
+        if not normalized:
+            raise HTTPException(
+                status_code=400,
+                detail=f"地址不合法：{item}（应为 host:port，例如 127.0.0.1:8188；"
+                       f"WaaS 实例可直接填域名，例如 200f9a378f9b418bb781d3b6d74dd8b9.region1.waas.aigate.cc）",
+            )
+        if normalized in cleaned:
             continue
-        s = re.sub(r"^https?://", "", s)
-        s = s.rstrip("/")
-        if ":" not in s:
-            raise HTTPException(status_code=400, detail=f"地址缺少端口号：{item}（应为 host:port，例如 127.0.0.1:8188）")
-        host, _, port = s.rpartition(":")
-        if not host or not port.isdigit():
-            raise HTTPException(status_code=400, detail=f"地址不合法：{item}（应为 host:port，例如 127.0.0.1:8188）")
-        if s in cleaned:
-            continue
-        cleaned.append(s)
+        cleaned.append(normalized)
     if not cleaned:
         raise HTTPException(status_code=400, detail="至少保留一个 ComfyUI 后端地址")
     # 写入 env 文件
@@ -19122,6 +21258,8 @@ def save_comfyui_instances(payload: ComfyInstancesPayload):
         if addr in new_load:
             new_load[addr] = n
     BACKEND_LOCAL_LOAD = new_load
+    # 主机列表变了，轮流派的起点也清掉，下一轮从头开始
+    ROUND_ROBIN_STATE["last"] = None
     return {"instances": COMFYUI_INSTANCES}
 
 @app.get("/api/workflows")

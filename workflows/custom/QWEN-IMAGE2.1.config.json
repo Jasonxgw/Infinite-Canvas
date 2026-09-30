@@ -1,0 +1,63 @@
+{
+  "title": "QWEN-IMAGE2.1",
+  "fields": [
+    {
+      "id": "f_seed",
+      "node": "474",
+      "input": "seed",
+      "name": "随机种子",
+      "type": "number",
+      "default": 931764483787803,
+      "min": null,
+      "max": null,
+      "step": 1.0,
+      "options": [],
+      "random_enabled": true,
+      "bind_prompt": null,
+      "multi": false,
+      "max_items": null,
+      "max_side": null,
+      "prefix": "",
+      "nodes": []
+    },
+    {
+      "id": "f_8rehqbj",
+      "node": "504",
+      "input": "value",
+      "name": "数值",
+      "type": "textarea",
+      "default": "Full character turnaround sheet on a plain neutral seamless mid-grey backdrop, three full-body views of the same person standing side by side in a row: front view on the left, left profile view in the centre, back view on the right. Identical pose in all three views — arms relaxed at the sides, feet shoulder-width apart, head level, neutral expression, mouth closed. Consistent scale across views, eye-level camera, identical even lighting on all three. Full body head-to-toe visible in every view, generous margin around the figure.\na sixteen-year-old East Asian boy, adolescent with smooth unlined cheeks, slender but sinewy build hardened by three years of hauling ore, gaunt hollow-cheeked face, skin tanned a dusty yellow-grey with dark grit settled in the creases, dark brown eyes, the left iris carrying a thin frost-like ring of pale silver, black hair slightly long and unbound with loose strands falling across the right brow.\nThe back view shows a rope burn scar across the right shoulder, healed and cracked open again at the edges, and a back laced with old scar tissue overlaid by a set of newer straight linear scars.\nHe wears a faded coarse hemp short jacket washed pale and split at the elbows, a plain hemp rope knotted at the waist, a ragged uneven hem, and is barefoot with mud-dark soles.\nAt his waist hangs a short knife a foot and three inches long, its blade carrying three deep nicks, its grip wrapped in old cloth worn concave into the exact shape of a hand; a small heavy black iron token, palm-sized, hangs at his chest on a cord, its faces carved with short worn characters smoothed by years of handling.\nPhotorealistic live-action costume test photograph, real human being, shot on ARRI Alexa with a 50mm lens at eye level, soft even studio key light from the front with subtle fill from both sides, flat neutral background, natural unretouched skin with visible pores, fine lines, uneven tone and blemishes, matte skin with no highlights, natural colour grading, plain documentary wardrobe-test lighting, no stylisation, 4K detail, 3:2\nnegative: illustration, painting, digital art, concept art, 3D render, CGI, anime, cel shading, cartoon, plastic skin, airbrushed skin, beauty filter, glamour lighting, fashion model pose, glossy hair, oversaturated colours, modern clothing, extra limbs, different faces between views, inconsistent character, three different people, changing proportions between views, watermark, text, logo",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false,
+      "bind_prompt": null,
+      "multi": false,
+      "max_items": null,
+      "max_side": null,
+      "prefix": "",
+      "nodes": []
+    }
+  ],
+  "mini_cards": {
+    "prompt": {
+      "x": 24,
+      "y": 30
+    },
+    "image": {
+      "x": 24,
+      "y": 210
+    },
+    "custom": {
+      "x": 280,
+      "y": 78
+    },
+    "output": {
+      "x": 540,
+      "y": 120
+    }
+  },
+  "output_node": "482",
+  "output_only": true
+}

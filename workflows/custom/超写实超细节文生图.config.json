@@ -1,0 +1,60 @@
+{
+  "title": "超写实超细节文生图",
+  "fields": [
+    {
+      "id": "f_seed",
+      "node": "148",
+      "input": "seed",
+      "name": "随机种子",
+      "type": "number",
+      "default": 0,
+      "min": null,
+      "max": null,
+      "step": 1.0,
+      "options": [],
+      "random_enabled": true,
+      "bind_prompt": null,
+      "multi": false,
+      "max_items": null,
+      "max_side": null,
+      "prefix": ""
+    },
+    {
+      "id": "f_prompt",
+      "node": "133:125",
+      "input": "text",
+      "name": "提示词文本",
+      "type": "textarea",
+      "default": "你是一个提示词专家，根据用户输入的内容扩写并润色，并输出详细的提示词，提示词要求中文自然语言一段输出，无需多余的结构；提示词要求包含主体，人物的年龄，人种，发型，服装，表情，动作，场景环境，景别，角度，光照，氛围等尽可能详细的内容。\n1.如果用户无输入，则自行按照格式随机发挥\n2.如用户没有限定人种，那默认为亚洲人种\n3.如用户没有限定年龄，那默认为18-20岁\n4.如用户没有限定风格，那默认为写实，随拍，真实照片质感\n用户的内容是：",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false,
+      "bind_prompt": true,
+      "multi": false,
+      "max_items": null,
+      "max_side": null,
+      "prefix": ""
+    }
+  ],
+  "mini_cards": {
+    "prompt": {
+      "x": 24,
+      "y": 30
+    },
+    "image": {
+      "x": 24,
+      "y": 210
+    },
+    "custom": {
+      "x": 280,
+      "y": 78
+    },
+    "output": {
+      "x": 540,
+      "y": 120
+    }
+  },
+  "output_node": "132"
+}

@@ -1425,7 +1425,7 @@ function refreshOutputTimer(){
                 document.querySelectorAll('.output-time-pill.running').forEach(pill => {
                     const pendingId = pill.closest('[data-pending-id]')?.dataset.pendingId;
                     const pending = pendingById.get(pendingId);
-                    if(pending) pill.textContent = formatRunDuration(nowMs() - Number(pending.startedAt || nowMs()));
+                    if(pending) pill.textContent = pendingTimerLabel(pending);
                 });
             } else {
                 clearInterval(outputTimer);
@@ -1446,6 +1446,10 @@ function serializableCanvasNode(node){
     delete copy._cascadeIdx;
     delete copy._cascadeFailed;
     delete copy._activeLoopCtx;
+    // 渲染进度是实时状态，不写进画布存档
+    if(Array.isArray(copy._pending)){
+        copy._pending = copy._pending.map(item => { const {progress, ...rest} = item || {}; return rest; });
+    }
     return copy;
 }
 function serializableCanvasNodes(list=nodes){
@@ -2623,6 +2627,7 @@ function addVideoNode(point){
         videoSource:'api',
         comfyWorkflow:'',
         comfyParams:{},
+        comfyFreeMemory:false,
         apiProvider:providerId,
         model:models[0] || videoModels[0] || DEFAULT_VIDEO_MODELS[0],
         duration:5,
@@ -3176,11 +3181,13 @@ async function runMsGenNode(nodeId, opts={}){
     } catch(err){
         const metas = collectRunMetas(out, pendingIds);
         addGenerationLog({run, outputs:[], runMs:Math.max(...metas.map(m => m.runMs || 0), 0), error:err.message || String(err)});
-        if(out) out._pending = (out._pending || []).filter(p => !pendingIds.includes(p.id));
         if(isCascadeAbortError(err)){
+            if(out) out._pending = (out._pending || []).filter(p => !pendingIds.includes(p.id));
             if(opts.cascade) throw err;
             return;
         }
+        // 失败时保留占位，output 节点显示失败图标（悬停看原因），不再计时
+        failPendingOutputs(out, pendingIds, err.message || String(err));
         node.runStatus = 'failed'; node.runError = err.message || String(err);
         refreshRunNodes(node, out);
         if(opts.cascade) throw err;
@@ -3215,6 +3222,7 @@ function addComfyNode(point){
         customHeight:'',
         comfyWorkflow:'',
         comfyParams:{},
+        comfyFreeMemory:false,
         count:1,
         inputs:[]
     });
@@ -6083,11 +6091,73 @@ function pendingOutputStyle(pending){
     if(!size) return '';
     return ` style="aspect-ratio:${Math.max(1, size.w)}/${Math.max(1, size.h)}"`;
 }
+// 素材上传/准备工作流阶段只显示「准备中」，正式计时从任务提交给 ComfyUI 后台之后才开始
+function pendingTimerLabel(pending){
+    if(pending?.submitted === false) return langIsEn() ? 'Preparing…' : '准备中';
+    return formatRunDuration(nowMs() - Number(pending.startedAt || nowMs()));
+}
+// ComfyUI 后台渲染进度：阶段 · 步骤 · 百分比 · 已等待，展示在 output 节点的占位里
+function comfyProgressLabel(progress){
+    if(!progress) return '';
+    const parts = [];
+    const stage = String(progress.stage || '').trim();
+    if(stage){
+        if(!langIsEn()) parts.push(stage);
+        else parts.push(stage === '排队中' ? 'Queued' : stage === '渲染中' ? 'Rendering' : 'Submitting');
+    }
+    const value = Number(progress.value);
+    const total = Number(progress.max);
+    if(Number.isFinite(value) && Number.isFinite(total) && total > 0) parts.push(`${value}/${total}`);
+    const percent = Number(progress.percent);
+    if(Number.isFinite(percent)) parts.push(`${Math.round(percent)}%`);
+    return parts.join(' · ');
+}
+// 悬停在占位上看详细信息：prompt_id / 后端 / 队列 / 当前节点
+function comfyProgressTitle(progress){
+    if(!progress) return '';
+    const lines = [];
+    if(progress.prompt_id) lines.push(`prompt_id: ${progress.prompt_id}`);
+    if(progress.backend) lines.push(`${langIsEn() ? 'Backend' : '后端'}: ${progress.backend}`);
+    if(progress.queue) lines.push(`${langIsEn() ? 'Queue' : '队列'}: ${progress.queue}`);
+    if(progress.node) lines.push(`${langIsEn() ? 'Node' : '节点'}: ${progress.node}`);
+    const waited = Number(progress.waited);
+    if(Number.isFinite(waited)) lines.push(`${langIsEn() ? 'Waited' : '已等待'}: ${Math.round(waited)}s`);
+    return lines.join('\n');
+}
+// 只更新占位里的进度文字/进度条，不整块重绘 output 节点，避免闪烁
+function updatePendingProgressDom(pending){
+    if(!pending?.id) return;
+    const wrap = nodesEl?.querySelector(`.output-img-wrap[data-pending-id="${CSS.escape(pending.id)}"]`);
+    if(!wrap) return;
+    const label = comfyProgressLabel(pending.progress);
+    const text = wrap.querySelector('.output-progress-text');
+    if(text){
+        text.textContent = label;
+        text.style.display = label ? '' : 'none';
+    }
+    const bar = wrap.querySelector('.output-progress-bar');
+    if(bar){
+        const percent = Number(pending.progress?.percent);
+        const hasPercent = Number.isFinite(percent);
+        bar.style.display = hasPercent ? '' : 'none';
+        const fill = bar.querySelector('span');
+        if(fill && hasPercent) fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+    }
+    const title = comfyProgressTitle(pending.progress);
+    if(title) wrap.title = title;
+}
 function renderPendingOutput(pending){
     if(pending?.failed){
         const taskId = pending.recoverTaskId || '';
         const querying = Boolean(pending.querying);
         const msg = pending.error || tr('canvas.generationFailed');
+        if(!taskId){
+            // 生成失败：保留失败占位，显示失败图标、悬停看失败原因，不再计时
+            return `<div class="output-img-wrap loading-wrap failed-wrap" data-pending-id="${escapeAttr(pending.id)}" title="${escapeAttr(msg)}"${pendingOutputStyle(pending)}>
+                <i data-lucide="triangle-alert" class="output-failed-icon"></i>
+                <button class="output-del" title="${tr('common.delete')}">×</button>
+            </div>`;
+        }
         const sub = taskId ? `任务 ID：${escapeHtml(taskId)}` : '没有任务 ID，无法查询';
         return `<div class="output-img-wrap loading-wrap recoverable" data-pending-id="${escapeAttr(pending.id)}"${pendingOutputStyle(pending)}>
             <span class="output-time-pill failed">失败</span>
@@ -6100,7 +6170,11 @@ function renderPendingOutput(pending){
             <button class="output-del" title="${tr('common.delete')}">×</button>
         </div>`;
     }
-    return `<div class="output-img-wrap loading-wrap" data-pending-id="${escapeAttr(pending.id)}"${pendingOutputStyle(pending)}><span class="output-time-pill running">${formatRunDuration(nowMs() - Number(pending.startedAt || nowMs()))}</span><div class="output-spinner"></div><button class="output-del" title="${tr('common.delete')}">×</button></div>`;
+    const label = comfyProgressLabel(pending.progress);
+    const title = comfyProgressTitle(pending.progress);
+    const percent = Number(pending.progress?.percent);
+    const hasPercent = Boolean(pending.progress) && Number.isFinite(percent);
+    return `<div class="output-img-wrap loading-wrap" data-pending-id="${escapeAttr(pending.id)}"${title ? ` title="${escapeAttr(title)}"` : ''}${pendingOutputStyle(pending)}><span class="output-time-pill running">${pendingTimerLabel(pending)}</span><div class="output-progress-stack"><div class="output-spinner"></div><div class="output-progress-text"${label ? '' : ' style="display:none"'}>${escapeHtml(label)}</div><div class="output-progress-bar"${hasPercent ? '' : ' style="display:none"'}><span style="width:${hasPercent ? Math.max(0, Math.min(100, percent)) : 0}%"></span></div></div><button class="output-del" title="${tr('common.delete')}">×</button></div>`;
 }
 function captureOutputScrolls(){
     const state = new Map();
@@ -9607,6 +9681,20 @@ function comfyMediaMaxItems(field, kind='image'){
     if(Number.isFinite(explicit) && explicit > 0) return Math.floor(explicit);
     return kind === 'image' ? 9 : 3;
 }
+// 参考图上传前允许压缩到的最长边（0=不压缩）。远端 ComfyUI 显存有限，参考图按原分辨率
+// 参与编码，大图会明显抬高注意力/VAE 的显存峰值，工作流可在这里钉一个上限。
+function comfyMediaMaxSide(field, kind='image'){
+    if(kind !== 'image') return 0;
+    const explicit = Number(field?.max_side);
+    return Number.isFinite(explicit) && explicit > 0 ? Math.floor(explicit) : 0;
+}
+// 字段要写入的目标节点：默认是 field.node，声明了 field.nodes 时以其为准（一组参考
+// 素材可能同时喂给多个 conditioning 节点）。
+function comfyFieldTargets(field){
+    const list = Array.isArray(field?.nodes) ? field.nodes : [];
+    const targets = (list.length ? list : [field?.node]).map(t => String(t || '').trim()).filter(Boolean);
+    return [...new Set(targets)];
+}
 function comfyFields(node, kind='all'){
     const data = currentComfyWorkflow(node);
     const fields = data?.config?.fields || [];
@@ -9636,13 +9724,14 @@ function comfyRandomActive(node, fieldId){
 }
 function comfyRandomValue(field){
     const isFloat = Number(field.step) > 0 && Number(field.step) < 1;
-    let min = Number.isFinite(Number(field.min)) ? Number(field.min) : null;
-    let max = Number.isFinite(Number(field.max)) ? Number(field.max) : null;
     const name = `${field.input || ''} ${field.name || ''}`.toLowerCase();
     const looksSeed = name.includes('seed') || name.includes('noise') || name.includes('随机') || name.includes('噪');
-    if(min === null) min = looksSeed ? 1 : 0;
-    if(max === null || max <= min) max = looksSeed ? 4294967295 : 999999;
-    if(looksSeed) max = Math.min(max, 4294967295);
+    // 随机种子固定给 15 位随机整数（100000000000000 ~ 999999999999999）
+    if(looksSeed) return Math.floor(100000000000000 + Math.random() * 900000000000000);
+    let min = Number.isFinite(Number(field.min)) ? Number(field.min) : null;
+    let max = Number.isFinite(Number(field.max)) ? Number(field.max) : null;
+    if(min === null) min = 0;
+    if(max === null || max <= min) max = 999999;
     let value = min + Math.random() * (max - min);
     if(isFloat){
         const precision = Math.min(8, Math.max(1, String(field.step).split('.')[1]?.length || 2));
@@ -9735,12 +9824,20 @@ function renderComfyImages(list, node, imageInputs){
         const kind = mediaKindForRef(firstRef || src.preview);
         const icon = kind === 'video' ? 'file-video' : kind === 'audio' ? 'file-audio' : 'image';
         const label = kind === 'image' ? `${tr('canvas.image')} ${i + 1}` : `${nodeTitleForMedia({mediaKind:kind})} ${i + 1}`;
+        const mediaName = String(firstRef?.name || src.label || '').trim() || label;
+        // 鼠标悬停在素材上显示素材名称
+        item.title = mediaName;
         const previewHtml = kind === 'video' && src.preview && !isMissingAssetUrl(src.preview)
             ? canvasVideoPreviewHtml(src.preview, 256)
             : kind === 'audio'
                 ? `<i data-lucide="${icon}" class="w-6 h-6 text-slate-400"></i>`
                 : (src.preview && !isMissingAssetUrl(src.preview) ? canvasPreviewImgHtml(src.preview, 256) : (src.preview ? missingAssetHtml(src.preview, true) : `<i data-lucide="${icon}" class="w-6 h-6 text-slate-400"></i>`));
         item.innerHTML = `<span class="input-index">${i + 1}</span>${previewHtml}<span class="input-label">${escapeHtml(label)}</span>`;
+        // 点击素材 = 把它以 @引用 的形式写进「参考文字」
+        item.onclick = e => {
+            e.stopPropagation();
+            insertComfyMediaMention(node, firstRef || {url:src.preview, name:mediaName, kind});
+        };
         item.ondragstart = e => {
             e.stopPropagation();
             internalDrag = true;
@@ -10833,11 +10930,13 @@ async function runRhNode(nodeId, opts={}){
     } catch(err) {
         const meta = collectRunMeta(out, pendingId);
         addGenerationLog({run, outputs:[], runMs:meta.runMs || 0, error:err.message || String(err)});
-        if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
         if(isCascadeAbortError(err)){
+            if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
             if(opts.cascade) throw err;
             return;
         }
+        // 失败时保留占位，output 节点显示失败图标（悬停看原因），不再计时
+        failPendingOutputs(out, pendingId, err.message || String(err));
         node.runStatus = 'failed';
         node.runError = err.message || String(err);
         refreshRunNodes(node, out);
@@ -10921,14 +11020,19 @@ async function runRhModelNode(node, opts={}){
         if(statuses.includes('aborted')) throw cascadeAbortError(cascadeStopMessage());
         if(statuses.includes('failed')) throw new Error(node.runError || tr('canvas.generationFailed'));
     } catch(err) {
+        const aborted = isCascadeAbortError(err);
         const remainingPending = pendingIds.map(id => pendingById(out, id)).filter(Boolean);
         const removableIds = remainingPending.filter(p => !(p.failed && p.recoverTaskId)).map(p => p.id);
         if(removableIds.length){
             const metas = collectRunMetas(out, removableIds);
             addGenerationLog({run, outputs:[], runMs:Math.max(...metas.map(m => m.runMs || 0), 0), error:err.message || String(err)});
-            if(out) out._pending = (out._pending || []).filter(p => !removableIds.includes(p.id));
+            if(out){
+                // 主动中止就清掉占位；真的失败则保留占位显示失败图标（悬停看原因），不再计时
+                if(aborted) out._pending = (out._pending || []).filter(p => !removableIds.includes(p.id));
+                else failPendingOutputs(out, removableIds, err.message || String(err));
+            }
         }
-        if(isCascadeAbortError(err)){
+        if(aborted){
             node.running = false;
             refreshRunNodes(node, out);
             scheduleSave();
@@ -11073,6 +11177,16 @@ function insertComfyMention(node, area, fieldId, ref){
     scheduleSave();
     setStatus(langIsEn() ? `Referenced ${ref.name}` : `已引用 ${ref.name}`);
 }
+// 点击 Media 里的素材时，把它以 @引用 的形式写进「参考文字」这类文本字段
+function insertComfyMediaMention(node, ref){
+    if(!node || !ref?.url) return;
+    const fields = comfyFields(node);
+    const field = fields.find(f => f.builtin_prompt === true) || fields.find(f => f.type === 'textarea');
+    if(!field) return;
+    const area = nodesEl?.querySelector(`.node[data-id="${CSS.escape(node.id)}"] textarea[data-comfy-param="${CSS.escape(field.id)}"]`);
+    if(!area) return;
+    insertComfyMention(node, area, field.id, ref);
+}
 function renderComfyMentionPicker(node, area, fieldId){
     const picker = area?.closest('.field')?.querySelector('.comfy-mention-picker');
     if(!picker) return;
@@ -11178,6 +11292,10 @@ function renderComfySettings(container, node){
             </div>
             ${!selected ? `<div class="text-[11px] text-slate-400">${tr('canvas.comfyNoWorkflow')}</div>` : (!data ? `<div class="text-[11px] text-slate-400">${tr('canvas.comfyLoadingWorkflow')}</div>` : '')}
             ${data ? settingFields.map(f => renderComfyCustomField(node, f)).join('') || `<div class="text-[11px] text-slate-400">${tr('canvas.comfyNoExtraParams')}</div>` : ''}
+            <div class="gen-settings-row">
+                <button type="button" class="setting-check ${node.comfyFreeMemory ? 'active' : ''}" data-toggle-field="comfyFreeMemory"><span class="check-dot"></span>${tr('canvas.comfyFreeMemory')}</button>
+            </div>
+            <div class="text-[11px] text-slate-400">${tr('canvas.comfyFreeMemoryHint')}</div>
         `;
         if(selected && !data) ensureComfyWorkflow(selected).then(() => render());
     } else {
@@ -11226,8 +11344,19 @@ function renderComfySettings(container, node){
             if(handleComfyMentionKeydown(node, area, fieldId, e)) e.preventDefault();
         };
         area.onscroll = () => syncComfyMentionScroll(area);
+        // 鼠标在参考文字窗口里滚轮时滚动文本本身，不要让画布跟着缩放
+        area.onwheel = e => e.stopPropagation();
         area.onblur = () => setTimeout(() => closeComfyMentionPicker(area), 150);
     });
+}
+// 数字字段按工作流配置的 min/max/step 渲染，步进跟随配置（例如 0.1），而不是浏览器默认的 1
+function comfyNumberAttrs(field){
+    const attr = (name, value) => {
+        if(value === null || value === undefined || String(value).trim() === '') return '';
+        const num = Number(value);
+        return Number.isFinite(num) ? ` ${name}="${escapeAttr(num)}"` : '';
+    };
+    return `${attr('min', field?.min)}${attr('max', field?.max)}${attr('step', field?.step)}`;
 }
 function renderComfyCustomField(node, f){
     const value = comfyParamValue(node, f);
@@ -11266,17 +11395,18 @@ function renderComfyCustomField(node, f){
         </div>`;
     }
     const type = f.type === 'number' ? 'number' : 'text';
+    const numAttrs = type === 'number' ? comfyNumberAttrs(f) : '';
     if(comfyRandomEnabled(f)){
         const active = comfyRandomActive(node, f.id);
         return `<div class="gen-settings-row">
             <div class="comfy-random-field">
-                <label class="field"><div class="setting-title">${label}</div><input class="setting-input" type="number" data-comfy-param="${escapeHtml(f.id)}" data-comfy-type="number" value="${escapeHtml(value)}"></label>
+                <label class="field"><div class="setting-title">${label}</div><input class="setting-input" type="number"${numAttrs} data-comfy-param="${escapeHtml(f.id)}" data-comfy-type="number" value="${escapeHtml(value)}"></label>
                 <button class="tool-btn comfy-random-btn ${active ? 'active' : ''}" type="button" data-comfy-random="${escapeHtml(f.id)}" title="${active ? '随机已开启，点击关闭' : '随机已关闭，点击开启'}" aria-label="${active ? '随机已开启，点击关闭' : '随机已关闭，点击开启'}"><i data-lucide="dice-5" class="w-4 h-4"></i></button>
             </div>
         </div>`;
     }
     return `<div class="gen-settings-row">
-        <label class="field" style="flex:1"><div class="setting-title">${label}</div><input class="setting-input" type="${type}" data-comfy-param="${escapeHtml(f.id)}" data-comfy-type="${escapeHtml(f.type || 'text')}" value="${escapeHtml(value)}"></label>
+        <label class="field" style="flex:1"><div class="setting-title">${label}</div><input class="setting-input" type="${type}"${numAttrs} data-comfy-param="${escapeHtml(f.id)}" data-comfy-type="${escapeHtml(f.type || 'text')}" value="${escapeHtml(value)}"></label>
     </div>`;
 }
 function updateComfyField(node, input, event){
@@ -11650,14 +11780,19 @@ async function runGenerator(genId, opts={}){
         if(statuses.includes('aborted')) throw cascadeAbortError(cascadeStopMessage());
         if(statuses.includes('failed')) throw new Error(gen.runError || tr('canvas.generationFailed'));
     } catch(err) {
+        const aborted = isCascadeAbortError(err);
         const remainingPending = pendingIds.map(id => pendingById(out, id)).filter(Boolean);
         const removableIds = remainingPending.filter(p => !(p.failed && p.recoverTaskId)).map(p => p.id);
         if(removableIds.length){
             const metas = collectRunMetas(out, removableIds);
             addGenerationLog({run, outputs:[], runMs:Math.max(...metas.map(m => m.runMs || 0), 0), error:err.message || String(err)});
-            if(out) out._pending = (out._pending||[]).filter(p => !removableIds.includes(p.id));
+            if(out){
+                // 主动中止就清掉占位；真的失败则保留占位显示失败图标（悬停看原因），不再计时
+                if(aborted) out._pending = (out._pending||[]).filter(p => !removableIds.includes(p.id));
+                else failPendingOutputs(out, removableIds, err.message || String(err));
+            }
         }
-        if(isCascadeAbortError(err)){
+        if(aborted){
             gen.running = false;
             refreshRunNodes(gen, out);
             scheduleSave();
@@ -11947,11 +12082,13 @@ async function runVideoNode(nodeId, opts={}){
     } catch(err) {
         const meta = collectRunMeta(out, pendingId);
         addGenerationLog({run, outputs:[], runMs:meta.runMs || 0, error:err.message || String(err)});
-        if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
         if(isCascadeAbortError(err)){
+            if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
             if(opts.cascade) throw err;
             return;
         }
+        // 失败时保留占位，output 节点显示失败图标（悬停看原因），不再计时
+        failPendingOutputs(out, pendingId, err.message || String(err));
         node.runStatus = 'failed'; node.runError = err.message || String(err);
         refreshRunNodes(node, out);
         if(opts.cascade) throw err;
@@ -12194,11 +12331,13 @@ async function runMiniMaxNode(nodeId, opts={}){
         const meta = collectRunMeta(out, pendingId);
         const readable = miniMaxReadableError(err, engine);
         addGenerationLog({run, outputs:[], runMs:meta.runMs || 0, error:miniMaxLogError(err, engine)});
-        if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
         if(isCascadeAbortError(err)){
+            if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
             if(opts.cascade) throw err;
             return;
         }
+        // 失败时保留占位，output 节点显示失败图标（悬停看原因），不再计时
+        failPendingOutputs(out, pendingId, readable);
         node.runStatus = 'failed';
         node.runError = readable;
         refreshRunNodes(node, out);
@@ -12209,12 +12348,53 @@ async function runMiniMaxNode(nodeId, opts={}){
         refreshRunNodes(node, out);
     }
 }
-async function uploadCanvasUrlToComfy(url){
-    const blob = await fetch(url).then(r => {
+// 参考图上传前按最长边等比缩小，降低远端 ComfyUI 的显存峰值。
+// 缩小失败（浏览器不支持 createImageBitmap、图本身就是小图）时原样返回，不影响上传。
+async function downscaleBlobForComfy(blob, maxSide){
+    const limit = Number(maxSide);
+    if(!blob || !(limit > 0) || !String(blob.type || '').startsWith('image/')) return blob;
+    let bitmap;
+    try {
+        bitmap = await createImageBitmap(blob);
+    } catch(err) {
+        return blob;
+    }
+    const width = Number(bitmap.width) || 0;
+    const height = Number(bitmap.height) || 0;
+    const longest = Math.max(width, height);
+    if(!longest || longest <= limit){
+        bitmap.close?.();
+        return blob;
+    }
+    const scale = limit / longest;
+    const w = Math.max(1, Math.round(width * scale));
+    const h = Math.max(1, Math.round(height * scale));
+    try {
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
+        const shrunk = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+        if(shrunk && shrunk.size && shrunk.size < blob.size) return shrunk;
+    } catch(err) {
+        // 压缩只是优化，失败就按原图上传
+    } finally {
+        bitmap.close?.();
+    }
+    return blob;
+}
+async function uploadCanvasUrlToComfy(url, maxSide=0){
+    let blob = await fetch(url).then(r => {
         if(!r.ok) throw new Error(langIsEn() ? 'Image read failed' : '图片读取失败');
         return r.blob();
     });
-    const filename = (url || '').split('/').pop()?.split('?')[0] || `canvas_${Date.now()}.png`;
+    let filename = (url || '').split('/').pop()?.split('?')[0] || `canvas_${Date.now()}.png`;
+    const shrunk = await downscaleBlobForComfy(blob, maxSide);
+    if(shrunk !== blob){
+        blob = shrunk;
+        // 统一按 png 上传，避免扩展名和实际编码不一致
+        filename = `${filename.replace(/\.[^.]*$/, '')}.png`;
+    }
     const form = new FormData();
     form.append('files', blob, filename);
     const data = await fetch('/api/upload', {method:'POST', body:form}).then(async r => {
@@ -12223,10 +12403,10 @@ async function uploadCanvasUrlToComfy(url){
     });
     return data.files?.[0]?.comfy_name || filename;
 }
-async function comfyNameForRef(ref){
+async function comfyNameForRef(ref, maxSide=0){
     if(ref.comfy_name) return ref.comfy_name;
     if(!ref.url) throw new Error(langIsEn() ? 'Missing input image' : '缺少输入图片');
-    return uploadCanvasUrlToComfy(ref.url);
+    return uploadCanvasUrlToComfy(ref.url, maxSide);
 }
 async function runComfyUpscale(imageUrl, resolution, options={}){
     if(!imageUrl) throw new Error(actionFailed('studio.superResolution', langIsEn() ? 'missing input image' : '缺少输入图片'));
@@ -12809,6 +12989,13 @@ async function runLTXDirectorNode(nodeId, opts={}){
     const run = runSnapshot(node, globalPrompt || segments.map(s => s.prompt).join(' | '), refs);
     run.taskLabel = tr('canvas.ltxDirector');
     if(out) out._pending = [...(out._pending || []), makePendingForRun(pendingId, run, node, {refs, cascadeTargetId})];
+    // ComfyUI 后台的实时渲染进度：写进 pending 并只更新进度文字，避免整块重绘闪烁
+    const markLtxProgress = progress => {
+        const item = pendingById(out, pendingId);
+        if(!item || !progress) return;
+        item.progress = progress;
+        updatePendingProgressDom(item);
+    };
     if(!opts.cascade){
         node.running = true;
         refreshRunNodes(node, out);
@@ -12828,7 +13015,7 @@ async function runLTXDirectorNode(nodeId, opts={}){
             params,
             type:'ltx-director',
             client_id:CLIENT_ID
-        }, {cascadeTargetId});
+        }, {cascadeTargetId, onProgress:markLtxProgress});
         if(result.error) throw new Error(result.error);
         const outputs = comfyResultOutputs(result);
         if(!outputs.length) throw new Error(tr('canvas.ltxNoOutput'));
@@ -12843,12 +13030,14 @@ async function runLTXDirectorNode(nodeId, opts={}){
         scheduleSave();
     } catch(err) {
         const meta = collectRunMeta(out, pendingId);
-        if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
         addGenerationLog({run, outputs:[], runMs:meta.runMs || 0, error:err.message || String(err)});
         if(isCascadeAbortError(err)){
+            if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
             if(opts.cascade) throw err;
             return;
         }
+        // 失败时保留占位，output 节点显示失败图标（悬停看原因），不再计时
+        failPendingOutputs(out, pendingId, err.message || String(err));
         node.runStatus = 'failed';
         node.runError = err.message || String(err);
         refreshRunNodes(node, out);
@@ -12892,7 +13081,27 @@ async function runComfyNode(nodeId, opts={}){
     const run = runSnapshot(node, prompt, refs);
     run.taskLabel = comfyRunLabel(node);
     const requestSize = mode === 'text' ? {width:Number(node.width || 1024), height:Number(node.height || 1024)} : null;
-    if(out) out._pending = [...(out._pending||[]), makePendingForRun(pendingId, run, node, {refs, requestSize, cascadeTargetId})];
+    const pending = makePendingForRun(pendingId, run, node, {refs, requestSize, cascadeTargetId});
+    pending.submitted = false;
+    if(out) out._pending = [...(out._pending||[]), pending];
+    // output 节点从「提交给 ComfyUI 后台渲染」那一刻开始计时，前面上传素材、准备工作流的时间不计入
+    const markSubmitted = () => {
+        const item = pendingById(out, pendingId);
+        if(!item) return;
+        item.submitted = true;
+        item.startedAt = nowMs();
+    };
+    // ComfyUI 后台的实时渲染进度：写进 pending 并只更新进度文字，避免整块重绘闪烁
+    const markProgress = progress => {
+        const item = pendingById(out, pendingId);
+        if(!item || !progress) return;
+        item.progress = progress;
+        if(!item.submitted){
+            item.submitted = true;
+            item.startedAt = nowMs();
+        }
+        updatePendingProgressDom(item);
+    };
     if(!opts.cascade){
         node.running = true;
         refreshRunNodes(node, out);
@@ -12910,7 +13119,7 @@ async function runComfyNode(nodeId, opts={}){
                 workflow_json:'Z-Image.json',
                 type:'zimage',
                 client_id:CLIENT_ID
-            }, {cascadeTargetId});
+            }, {cascadeTargetId, onSubmitted:markSubmitted, onProgress:markProgress});
             images = comfyResultOutputs(result);
         } else if(mode === 'enhance'){
             run.taskLabel = tr('canvas.comfyEnhance');
@@ -12923,7 +13132,7 @@ async function runComfyNode(nodeId, opts={}){
                 },
                 type:'enhance',
                 client_id:CLIENT_ID
-            }, {cascadeTargetId});
+            }, {cascadeTargetId, onSubmitted:markSubmitted, onProgress:markProgress});
             if(enhance.error) throw new Error(actionFailed('canvas.comfyEnhance', enhance.error));
             if(!enhance.images?.length) throw new Error(noReturnedImage('canvas.comfyEnhance'));
             if(node.enhanceUpscale){
@@ -12958,32 +13167,57 @@ async function runComfyNode(nodeId, opts={}){
                 usedNodeIds.add(String(generatedNodeSeq));
                 return String(generatedNodeSeq);
             };
+            // 同一个素材只上传一次；多个素材并发上传，避免一个接一个串行等待
+            // （同一个文件在不同压缩上限下算两份，缓存 key 里带上上限）
+            const comfyUploads = new Map();
+            const comfyNameOf = (ref, maxSide=0) => {
+                const key = `${ref?.comfy_name || ref?.url || ref}|${Number(maxSide) || 0}`;
+                if(!comfyUploads.has(key)) comfyUploads.set(key, comfyNameForRef(ref, maxSide));
+                return comfyUploads.get(key);
+            };
             const assignMediaField = async (field, mediaRefs) => {
-                if(!field.node || !field.input) return;
+                // 一个字段可以声明多个目标节点（field.nodes），例如 MINIMAX-H3 的
+                // LOW/HIGH 两段 conditioning 需要吃同一组参考素材。
+                const targets = comfyFieldTargets(field);
+                if(!targets.length || !field.input) return;
                 const kind = ['audio','video'].includes(field.type) ? field.type : 'image';
+                const maxSide = comfyMediaMaxSide(field, kind);
                 const picked = (mediaRefs || []).slice(0, comfyMediaMaxItems(field, kind));
-                params[field.node] = params[field.node] || {};
+                targets.forEach(t => { params[t] = params[t] || {}; });
                 if(!field.multi){
-                    const name = picked.length ? await comfyNameForRef(picked[0]) : '';
-                    params[field.node][field.input] = name || '';
+                    const name = picked.length ? await comfyNameOf(picked[0], maxSide) : '';
+                    params[targets[0]][field.input] = name || '';
                     return;
                 }
                 // 动态多输入（COMFY_AUTOGROW_V3）按「输入名.前缀+序号」写入，例如
                 // ref_images.ref_image_0：工作流导出时自带的参考素材先清空，只按画布实际
                 // 连接的引用重建；未连接引用时该输入整体省略（不启用）。
-                Object.keys((wf?.workflow || {})?.[field.node]?.inputs || {}).forEach(key => {
-                    if(key.startsWith(`${field.input}.`)) params[field.node][key] = null;
+                targets.forEach(t => {
+                    Object.keys((wf?.workflow || {})?.[t]?.inputs || {}).forEach(key => {
+                        if(key.startsWith(`${field.input}.`)) params[t][key] = null;
+                    });
                 });
                 const prefix = comfyAutogrowPrefix(field, kind);
                 const spec = autogrowNodeSpec(kind);
                 for(let i = 0; i < picked.length; i++){
-                    const name = await comfyNameForRef(picked[i]);
+                    const name = await comfyNameOf(picked[i], maxSide);
                     if(!name) continue;
-                    const loadNodeId = allocateNodeId();
-                    params[loadNodeId] = {class_type:spec.class_type, inputs:{[spec.input]:name}};
-                    params[field.node][`${field.input}.${prefix}${i}`] = [loadNodeId, spec.out];
+                    targets.forEach(t => {
+                        const loadNodeId = allocateNodeId();
+                        params[loadNodeId] = {class_type:spec.class_type, inputs:{[spec.input]:name}};
+                        params[t][`${field.input}.${prefix}${i}`] = [loadNodeId, spec.out];
+                    });
                 }
             };
+            // 先并发把各字段会用到的素材传到 ComfyUI，再拼参数，缩短提交前的等待时间
+            await Promise.all([
+                ...imageFields.flatMap(f => refs.slice(0, comfyMediaMaxItems(f, 'image'))
+                    .map(r => comfyNameOf(r, comfyMediaMaxSide(f, 'image')))),
+                ...videoFields.flatMap(f => videoRefsOnly(allRefs).slice(0, comfyMediaMaxItems(f, 'video'))
+                    .map(r => comfyNameOf(r))),
+                ...audioFields.flatMap(f => audioRefsOnly(allRefs).slice(0, comfyMediaMaxItems(f, 'audio'))
+                    .map(r => comfyNameOf(r)))
+            ]);
             for(const f of imageFields) await assignMediaField(f, refs);
             for(const f of videoFields) await assignMediaField(f, videoRefsOnly(allRefs));
             for(const f of audioFields) await assignMediaField(f, audioRefsOnly(allRefs));
@@ -13006,15 +13240,15 @@ async function runComfyNode(nodeId, opts={}){
                 workflow_json:workflowName,
                 params,
                 type:'workflow-custom',
-                client_id:CLIENT_ID
-            }, {cascadeTargetId});
+                client_id:CLIENT_ID,
+                comfy_free_memory:node.comfyFreeMemory === true
+            }, {cascadeTargetId, onSubmitted:markSubmitted, onProgress:markProgress});
             if(result.error) throw new Error(actionFailed('canvas.comfyCustom', result.error));
             images = comfyResultOutputs(result);
             if(!images.length) throw new Error(noReturnedImage('canvas.comfyCustom'));
         } else {
             run.taskLabel = tr('canvas.comfyEdit');
-            const names = [];
-            for (const ref of refs.slice(0, 3)) names.push(await comfyNameForRef(ref));
+            const names = await Promise.all(refs.slice(0, 3).map(ref => comfyNameForRef(ref)));
             const result = await submitComfyTask(run, {
                 prompt,
                 workflow_json:'Flux2-Klein.json',
@@ -13029,7 +13263,7 @@ async function runComfyNode(nodeId, opts={}){
                     "314": { value:Boolean(names[2]) }
                 },
                 client_id:CLIENT_ID
-            }, {cascadeTargetId});
+            }, {cascadeTargetId, onSubmitted:markSubmitted, onProgress:markProgress});
             if(result.error) throw new Error(actionFailed('canvas.comfyEdit', result.error));
             if(!result.images?.length) throw new Error(noReturnedImage('canvas.comfyEdit'));
             images = node.editUpscale ? await runComfyUpscale(result.images?.[0], node.editUpscaleRes || 2048, {cascadeTargetId}) : result.images || [];
@@ -13045,12 +13279,14 @@ async function runComfyNode(nodeId, opts={}){
     } catch(err) {
         const meta = collectRunMeta(out, pendingId);
         addGenerationLog({run, outputs:[], runMs:meta.runMs || 0, error:err.message || String(err)});
-        if(out) out._pending = (out._pending||[]).filter(p => p.id !== pendingId);
         if(isCascadeAbortError(err)){
+            if(out) out._pending = (out._pending||[]).filter(p => p.id !== pendingId);
             refreshRunNodes(node, out);
             if(opts.cascade) throw err;
             return;
         }
+        // 提交/渲染失败时保留占位，output 节点显示失败图标（悬停看原因），不再计时
+        failPendingOutputs(out, pendingId, err.message || String(err));
         node.runStatus = 'failed'; node.runError = err.message || String(err);
         refreshRunNodes(node, out);
         if(opts.cascade) throw err;
@@ -14197,7 +14433,10 @@ async function createCanvasComfyTask(payload, options={}){
         body:JSON.stringify(payload)
     }, options);
     if(!res.ok) throw new Error(await responseErrorMessage(res, actionFailed('canvas.comfyGenerate')));
-    return res.json();
+    const task = await res.json();
+    // 任务已经提交给 ComfyUI 后台渲染，从这里开始给 output 节点计时
+    if(typeof options.onSubmitted === 'function') options.onSubmitted(task);
+    return task;
 }
 async function waitCanvasComfyTaskResult(taskId, options={}){
     if(!taskId) throw new Error(actionFailed('canvas.comfyGenerate'));
@@ -14212,6 +14451,8 @@ async function waitCanvasComfyTaskResult(taskId, options={}){
         const data = await res.json();
         if(data.status === 'succeeded') return data.result || {};
         if(data.status === 'failed') throw new Error(data.error || actionFailed('canvas.comfyGenerate'));
+        // 后端每轮都带上 ComfyUI 的实时进度（队列位置/步骤/耗时），转给 output 节点展示
+        if(typeof options.onProgress === 'function') options.onProgress(data.progress || null, data);
         await sleep(1600);
     }
 }
@@ -14398,6 +14639,20 @@ function completeCanvasImageTask(taskId, result){
     refreshRunNodes(gen, out);
     scheduleSave();
 }
+// 生成失败时不清掉 output 节点上的占位，改为保留「失败」标记：显示失败图标、悬停看失败原因、不再计时
+function failPendingOutputs(out, ids, message){
+    if(!out) return;
+    const list = Array.isArray(ids) ? ids : [ids];
+    const err = message || tr('canvas.generationFailed');
+    (out._pending || []).forEach(p => {
+        if(!list.includes(p.id)) return;
+        p.failed = true;
+        p.querying = false;
+        p.error = err;
+        p.recoverTaskId = p.recoverTaskId || '';
+        p.canvasTaskStatus = 'failed';
+    });
+}
 function failCanvasImageTask(taskId, message, taskData={}){
     const found = findPendingTask(taskId);
     if(!found) return;
@@ -14424,7 +14679,8 @@ function failCanvasImageTask(taskId, message, taskData={}){
         scheduleSave();
         return;
     }
-    out._pending = (out._pending || []).filter(p => p.id !== pending.id);
+    // 无法找回的任务：占位留在 output 节点上显示失败图标，悬停看失败原因
+    failPendingOutputs(out, pending.id, message);
     if(gen){
         gen.runStatus = 'failed';
         gen.runError = message || tr('canvas.generationFailed');

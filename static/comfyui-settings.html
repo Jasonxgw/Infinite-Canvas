@@ -18,7 +18,7 @@
     <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.28.1789174829"></script>
     <script src="/static/vendor/js/lucide.js?v=2026.08.28.1789174829"></script>
     <script src="/static/js/theme.js?v=2026.08.28.1789174829"></script>
-    <script src="/static/js/i18n.js?v=2026.08.28.1789219828"></script>
+    <script src="/static/js/i18n.js?v=2026.08.28.1790353657"></script>
     <link rel="stylesheet" href="/static/css/comfyui-settings.css?v=2026.08.28.1789174829">
     <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.28.1789174829">
 </head>
@@ -46,7 +46,16 @@
                                 <i data-lucide="save" class="w-3.5 h-3.5"></i><span>保存</span>
                             </button>
                         </div>
-                        <div style="font-size:10.5px;color:var(--faint);line-height:1.55;font-weight:600">格式：<span style="font-family:ui-monospace,Menlo,monospace">host:port</span>（如 <span style="font-family:ui-monospace,Menlo,monospace">127.0.0.1:8188</span>）</div>
+                        <div style="display:flex;align-items:center;gap:6px">
+                            <button class="upload-btn" type="button" onclick="checkComfyInstances(true)" style="flex:1">
+                                <i data-lucide="plug-zap" class="w-3.5 h-3.5"></i><span data-i18n="comfy.checkNow">检测连接</span>
+                            </button>
+                            <label style="display:flex;align-items:center;gap:4px;font-size:10.5px;color:var(--faint);font-weight:700;cursor:pointer;white-space:nowrap">
+                                <input type="checkbox" id="autoCheckInstances" checked onchange="toggleComfyAutoCheck(this.checked)">
+                                <span data-i18n="comfy.autoCheck">自动检测</span>
+                            </label>
+                        </div>
+                        <div style="font-size:10.5px;color:var(--faint);line-height:1.55;font-weight:600">格式：<span style="font-family:ui-monospace,Menlo,monospace">host:port</span>（如 <span style="font-family:ui-monospace,Menlo,monospace">127.0.0.1:8188</span>）；智算 WaaS 实例直接填域名，如 <span style="font-family:ui-monospace,Menlo,monospace">200f9a378f9b418bb781d3b6d74dd8b9.region1.waas.aigate.cc</span>（自动按 https 443 访问）</div>
                     </div>
 
                     <div class="side-card workflow-panel workflow-panel-comfy">
@@ -122,6 +131,6 @@
         <img id="imageLightboxImg" src="" alt="preview" onclick="event.stopPropagation()">
     </div>
 
-    <script src="/static/js/comfyui-settings.js?v=2026.08.28.1789201418"></script>
+    <script src="/static/js/comfyui-settings.js?v=2026.08.28.1790234108"></script>
 </body>
 </html>

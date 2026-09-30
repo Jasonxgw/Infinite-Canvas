@@ -2,6 +2,17 @@
     if(!window.StudioI18n) return;
     window.StudioI18n.register({
         "comfy.title": { zh: "工作流设置", en: "Workflow Settings" },
+        "comfy.checkNow": { zh: "检测连接", en: "Check" },
+        "comfy.autoCheck": { zh: "自动检测", en: "Auto" },
+        "comfy.checking": { zh: "检测中…", en: "Checking…" },
+        "comfy.notChecked": { zh: "未检测", en: "Not checked" },
+        "comfy.connected": { zh: "已连接", en: "Connected" },
+        "comfy.disconnected": { zh: "连接失败", en: "Failed" },
+        "comfy.hostIdle": { zh: "空闲", en: "idle" },
+        "comfy.hostTasks": { zh: "运行 {running} · 排队 {pending}", en: "running {running} · queued {pending}" },
+        "comfy.checkSummary": { zh: "已连接 {ok} 台 · 失败 {fail} 台", en: "{ok} connected · {fail} failed" },
+        "comfy.checkFailed": { zh: "检测请求没发出去，稍后再试", en: "Check request failed — try again" },
+        "comfy.needAddress": { zh: "请先填写后端地址", en: "Enter a backend address first" },
         "comfy.subtitle": { zh: "选择本地 ComfyUI 工作流，配置可暴露到画布的输入参数。", en: "Choose local ComfyUI workflows, then configure the inputs exposed to Canvas." },
         "comfy.localWorkflowMode": { zh: "本地 ComfyUI 工作流", en: "Local ComfyUI Workflow" },
         "comfy.workflowList": { zh: "工作流列表", en: "Workflows" },
