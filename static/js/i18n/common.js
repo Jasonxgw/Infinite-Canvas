@@ -32,6 +32,7 @@
         "nav.canvas": { zh: "无限画布", en: "Infinite Canvas" },
         "nav.scriptStudio": { zh: "剧本分镜", en: "Script Studio" },
         "nav.assetManager": { zh: "素材库", en: "Assets" },
+        "nav.usage": { zh: "用量统计", en: "Usage & Cost" },
         "nav.runtimeLogs": { zh: "运行日志", en: "Runtime Logs" },
         "bulk.manage": { zh: "管理", en: "Manage" },
         "bulk.selectAll": { zh: "全选", en: "Select All" },

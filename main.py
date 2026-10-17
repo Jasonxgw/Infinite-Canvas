@@ -348,6 +348,10 @@ SCRIPT_STORYBOARD_PATH = os.path.join(DATA_DIR, "script_storyboards.json")
 # 切换剧本等于换一整套工作区，各存各的进度
 SCRIPT_PROJECT_PATH = os.path.join(DATA_DIR, "script_projects.json")
 API_PROVIDERS_FILE = os.path.join(DATA_DIR, "api_providers.json")
+# LLM 文本调用用量流水：一天一个 JSONL，只追加不重写；查询时再聚合折算费用。
+# 单价表单独落盘，页面可改，改完立即重算（所以不做预聚合）。
+LLM_USAGE_DIR = os.path.join(DATA_DIR, "llm_usage")
+MODEL_PRICING_PATH = os.path.join(DATA_DIR, "model_pricing.json")
 RUNNINGHUB_WORKFLOW_STORE_FILE = os.path.join(DATA_DIR, "runninghub_workflows.json")
 SHARED_FOLDERS_FILE = os.path.join(DATA_DIR, "shared_folders.json")
 GLOBAL_CONFIG_FILE = os.path.join(BASE_DIR, "global_config.json")
@@ -411,6 +415,8 @@ QUEUE_LOCK = Lock()
 HISTORY_LOCK = Lock()
 GLOBAL_CONFIG_LOCK = Lock()
 CONVERSATION_LOCK = Lock()
+# LLM 用量流水与单价表的读写锁（流水只追加，单价表整表重写 + 备份）
+USAGE_LOCK = Lock()
 CANVAS_LOCK = Lock()
 LOAD_LOCK = Lock()
 RUNNINGHUB_WORKFLOW_LOCK = Lock()
@@ -4715,6 +4721,351 @@ def text_delta_from_chat_chunk(data):
 def sse_event(data):
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
+# --- LLM 用量统计 ---
+# 只统计 LLM 文本调用（所有 chat/completions 类）。图片/视频生成不纳入。
+# 每次调用写一行流水到 data/llm_usage/usage-YYYYMMDD.jsonl，聚合与费用折算都在查询时做，
+# 因为单价可随时被用户修改，任何预聚合的金额都会失效。
+
+# 部分上游（尤其聚合平台的流式接口）不接受 stream_options 参数，
+# 首次被拒后把平台 id 记进来，后续同一进程内不再重复试探。
+_STREAM_USAGE_UNSUPPORTED = set()
+# 每天最多清理一次过期流水
+_USAGE_PRUNED_DAY = ""
+
+DEFAULT_MODEL_PRICING = {
+    "version": 1,
+    "unit": "per_1m_tokens",
+    "currency": "CNY",
+    "models": {
+        "deepseek-flash": {"input": 2.0, "output": 8.0, "note": "参考价，可修改"},
+        "deepseek-chat": {"input": 2.0, "output": 8.0, "note": "参考价，可修改"},
+        "deepseek-reasoner": {"input": 4.0, "output": 16.0, "note": "参考价，可修改"},
+        "deepseek-v4-pro": {"input": 4.0, "output": 12.0, "note": "参考价，可修改"},
+        "gpt-4o": {"input": 18.0, "output": 72.0, "note": "参考价，可修改"},
+        "gpt-4o-mini": {"input": 1.1, "output": 4.4, "note": "参考价，可修改"},
+        "qwen-plus": {"input": 0.8, "output": 2.0, "note": "参考价，可修改"},
+        "glm-4-flash": {"input": 0.0, "output": 0.0, "note": "参考价，可修改"},
+    },
+}
+
+def _usage_day_str():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+def _usage_file_for(day_str):
+    return os.path.join(LLM_USAGE_DIR, "usage-" + str(day_str or "").replace("-", "") + ".jsonl")
+
+def normalize_usage(raw):
+    """把各上游五花八门的 usage 结构归一成 (prompt_tokens, completion_tokens, total_tokens)。
+
+    兼容 APIMart 的 {"code":200,"data":{...}} 包裹层，以及 input_tokens/output_tokens 命名。
+    三个值全缺失时返回 (None, None, None)，交由调用方决定是否走估算。
+    """
+    if not isinstance(raw, dict):
+        return (None, None, None)
+    data = raw
+    if isinstance(data.get("usage"), dict):
+        data = data["usage"]
+    elif isinstance(data.get("data"), dict) and isinstance(data["data"].get("usage"), dict):
+        data = data["data"]["usage"]
+
+    def _to_int(value):
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    prompt = _to_int(data.get("prompt_tokens", data.get("input_tokens")))
+    completion = _to_int(data.get("completion_tokens", data.get("output_tokens")))
+    total = _to_int(data.get("total_tokens"))
+    if total is None and (prompt is not None or completion is not None):
+        total = (prompt or 0) + (completion or 0)
+    if prompt is None and total is not None and completion is not None:
+        prompt = max(total - completion, 0)
+    if completion is None and total is not None and prompt is not None:
+        completion = max(total - prompt, 0)
+    if prompt is None and completion is None and total is None:
+        return (None, None, None)
+    return (prompt, completion, total)
+
+_STREAM_OPTIONS_ERROR_HINTS = ("stream_options", "unsupported", "unknown parameter", "unrecognized", "not supported")
+
+def apply_stream_usage_option(body, provider_id, provider_cfg, model):
+    """给流式请求体按条件加 stream_options：仅 OpenAI 协议、且该平台没被拒过时才加。
+
+    返回是否真的加上了，调用方据此决定要不要在 400 时回退重试。
+    """
+    pid = str(provider_id or "").strip().lower()
+    if pid and pid in _STREAM_USAGE_UNSUPPORTED:
+        return False
+    if effective_protocol(provider_cfg or {}, model) != "openai":
+        return False
+    body["stream_options"] = {"include_usage": True}
+    return True
+
+def stream_options_rejected(status_code, body_text):
+    """判断 400 是否是因为上游不认 stream_options，从而需要回退。"""
+    if int(status_code or 0) != 400:
+        return False
+    text = str(body_text or "").lower()
+    return any(hint in text for hint in _STREAM_OPTIONS_ERROR_HINTS)
+
+def prune_usage_files(keep_days=180):
+    """保留最近 keep_days 天的流水，超过就删；每天最多执行一次。"""
+    global _USAGE_PRUNED_DAY
+    today = _usage_day_str()
+    if _USAGE_PRUNED_DAY == today:
+        return
+    _USAGE_PRUNED_DAY = today
+    try:
+        if not os.path.isdir(LLM_USAGE_DIR):
+            return
+        cutoff = time.strftime("%Y%m%d", time.localtime(time.time() - keep_days * 86400))
+        for name in os.listdir(LLM_USAGE_DIR):
+            match = re.match(r"^usage-(\d{8})\.jsonl$", name)
+            if match and match.group(1) < cutoff:
+                try:
+                    os.remove(os.path.join(LLM_USAGE_DIR, name))
+                except OSError:
+                    pass
+    except Exception as exc:
+        print(f"[usage] 清理过期流水失败: {exc}")
+
+def record_llm_usage(provider, model, feature, usage=None, *, conversation_id="",
+                     ok=True, error="", prompt_text="", completion_text="", request_id="", ts=None):
+    """把一次 LLM 文本调用的 token 用量追加到当天流水文件。
+
+    上游没回 usage 时按字符数粗估（estimated=True）；任何异常都不允许中断主流程。
+    注意：这是纯记账函数，绝不因它抛错而影响原有对话/剧本链路。
+    """
+    try:
+        provider_id = str(provider or "").strip()
+        provider_name = provider_id
+        try:
+            if provider_id:
+                cfg = get_api_provider(provider_id)
+                provider_name = str((cfg or {}).get("name") or provider_id)
+        except Exception:
+            # get_api_provider 找不到平台时会抛 400，这里只取展示名，失败就退回 id
+            pass
+        prompt_tokens, completion_tokens, total_tokens = normalize_usage(usage)
+        estimated = False
+        if total_tokens is None:
+            if prompt_text or completion_text:
+                prompt_tokens = int(len(prompt_text or "") / 3.5)
+                completion_tokens = int(len(completion_text or "") / 3.5)
+                total_tokens = prompt_tokens + completion_tokens
+            else:
+                prompt_tokens, completion_tokens, total_tokens = 0, 0, 0
+            estimated = True
+        ts = int(ts) if ts else now_ms()
+        record = {
+            "ts": ts,
+            "date": time.strftime("%Y-%m-%d", time.localtime(ts / 1000)),
+            "provider": provider_id,
+            "provider_name": provider_name,
+            "model": str(model or ""),
+            "feature": str(feature or ""),
+            "conversation_id": str(conversation_id or ""),
+            "prompt_tokens": int(prompt_tokens or 0),
+            "completion_tokens": int(completion_tokens or 0),
+            "total_tokens": int(total_tokens or 0),
+            "estimated": estimated,
+            "ok": bool(ok),
+            "error": str(error or "")[:200],
+            "request_id": str(request_id or ""),
+        }
+        os.makedirs(LLM_USAGE_DIR, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False)
+        with USAGE_LOCK:
+            with open(_usage_file_for(record["date"]), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        prune_usage_files()
+    except Exception as exc:
+        print(f"[usage] 记录 LLM 用量失败: {exc}")
+
+def load_model_pricing():
+    """读单价表；文件不存在或损坏时回退到内置默认价目表（不写盘）。"""
+    data = None
+    try:
+        if os.path.exists(MODEL_PRICING_PATH):
+            with open(MODEL_PRICING_PATH, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+    except Exception as exc:
+        print(f"加载模型单价失败: {exc}")
+        data = None
+    if not isinstance(data, dict):
+        data = json.loads(json.dumps(DEFAULT_MODEL_PRICING))
+    data["version"] = int(data.get("version") or 1)
+    data["unit"] = "per_1m_tokens"
+    data["currency"] = str(data.get("currency") or "CNY").strip().upper() or "CNY"
+    if not isinstance(data.get("models"), dict):
+        data["models"] = json.loads(json.dumps(DEFAULT_MODEL_PRICING["models"]))
+    return data
+
+def save_model_pricing(payload):
+    """整表保存单价表；写前先备份成 model_pricing.backup-<ts>.json（对齐既有惯例）。"""
+    raw_models = (payload or {}).get("models") if isinstance(payload, dict) else None
+    models = {}
+    if isinstance(raw_models, dict):
+        for name, entry in raw_models.items():
+            key = str(name or "").strip()
+            if not key or not isinstance(entry, dict):
+                continue
+            def _price(value):
+                try:
+                    return max(float(value or 0), 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+            item = {"input": _price(entry.get("input")), "output": _price(entry.get("output"))}
+            note = str(entry.get("note") or "").strip()
+            if note:
+                item["note"] = note[:200]
+            currency = str(entry.get("currency") or "").strip().upper()
+            if currency:
+                item["currency"] = currency
+            models[key] = item
+    data = {
+        "version": int((payload or {}).get("version") or 1) if isinstance(payload, dict) else 1,
+        "unit": "per_1m_tokens",
+        "currency": (str((payload or {}).get("currency") or "CNY").strip().upper() or "CNY") if isinstance(payload, dict) else "CNY",
+        "models": models,
+    }
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with USAGE_LOCK:
+        if os.path.exists(MODEL_PRICING_PATH):
+            try:
+                shutil.copy2(MODEL_PRICING_PATH, MODEL_PRICING_PATH.replace(".json", f".backup-{now_ms()}.json"))
+            except Exception as exc:
+                print(f"备份模型单价失败: {exc}")
+        with open(MODEL_PRICING_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    return data
+
+def price_for_model(model, pricing=None):
+    """按模型名查单价：小写、去掉 provider 前缀（deepseek/deepseek-flash）后匹配。"""
+    models = (pricing or {}).get("models") if isinstance(pricing, dict) else None
+    if not isinstance(models, dict):
+        models = load_model_pricing().get("models", {})
+    key = str(model or "").strip().lower()
+    if not key:
+        return None
+    lowered = {str(name).strip().lower(): entry for name, entry in models.items()}
+    candidates = [key]
+    for sep in ("/", ":"):
+        if sep in key:
+            candidates.append(key.split(sep, 1)[1])
+    for candidate in candidates:
+        entry = lowered.get(candidate)
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+def compute_cost(model, prompt_tokens, completion_tokens, pricing=None, report_currency=None):
+    """算一次调用的费用；查不到单价、或单价币种与报表币种不一致时返回 None（宁可标未计价也不混算）。"""
+    pricing = pricing if isinstance(pricing, dict) else load_model_pricing()
+    entry = price_for_model(model, pricing)
+    if not entry:
+        return None
+    report_currency = str(report_currency or pricing.get("currency") or "CNY").upper()
+    entry_currency = str(entry.get("currency") or report_currency).upper()
+    if entry_currency != report_currency:
+        return None
+    try:
+        input_price = float(entry.get("input") or 0)
+        output_price = float(entry.get("output") or 0)
+    except (TypeError, ValueError):
+        return None
+    return (prompt_tokens or 0) / 1e6 * input_price + (completion_tokens or 0) / 1e6 * output_price
+
+def iter_usage_records(start="", end="", newest_first=False):
+    """按日期范围（YYYY-MM-DD）逐行读流水，跳过坏行。文件名即日期，无需读文件内容也能过滤。"""
+    if not os.path.isdir(LLM_USAGE_DIR):
+        return
+    files = []
+    for name in os.listdir(LLM_USAGE_DIR):
+        match = re.match(r"^usage-(\d{8})\.jsonl$", name)
+        if not match:
+            continue
+        day = match.group(1)
+        iso = f"{day[:4]}-{day[4:6]}-{day[6:8]}"
+        if start and iso < start:
+            continue
+        if end and iso > end:
+            continue
+        files.append((iso, os.path.join(LLM_USAGE_DIR, name)))
+    files.sort(key=lambda item: item[0], reverse=newest_first)
+    for _iso, path in files:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(rec, dict):
+                        yield rec
+        except Exception as exc:
+            print(f"读取用量流水失败 {path}: {exc}")
+
+def _usage_bucket():
+    return {
+        "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+        "cost": 0.0, "requests": 0, "errors": 0,
+        "estimated_tokens": 0, "unpriced_tokens": 0,
+    }
+
+def _accumulate_usage(bucket, prompt_tokens, completion_tokens, total_tokens, cost, estimated):
+    bucket["prompt_tokens"] += prompt_tokens
+    bucket["completion_tokens"] += completion_tokens
+    bucket["total_tokens"] += total_tokens
+    bucket["requests"] += 1
+    if estimated:
+        bucket["estimated_tokens"] += total_tokens
+    if cost is None:
+        bucket["unpriced_tokens"] += total_tokens
+    else:
+        bucket["cost"] += cost
+
+def summarize_usage(start="", end=""):
+    """一次遍历同时汇总总量、按天、按模型、按用途，避免重复扫文件。费用在查询时折算。"""
+    pricing = load_model_pricing()
+    report_currency = str(pricing.get("currency") or "CNY")
+    totals = _usage_bucket()
+    days, models, features = {}, {}, {}
+    for rec in iter_usage_records(start, end):
+        prompt_tokens = int(rec.get("prompt_tokens") or 0)
+        completion_tokens = int(rec.get("completion_tokens") or 0)
+        total_tokens = int(rec.get("total_tokens") or 0) or (prompt_tokens + completion_tokens)
+        estimated = bool(rec.get("estimated"))
+        cost = compute_cost(rec.get("model"), prompt_tokens, completion_tokens, pricing, report_currency)
+        _accumulate_usage(totals, prompt_tokens, completion_tokens, total_tokens, cost, estimated)
+        if not rec.get("ok", True):
+            totals["errors"] += 1
+
+        day_key = str(rec.get("date") or "")
+        day_bucket = days.setdefault(day_key, _usage_bucket())
+        _accumulate_usage(day_bucket, prompt_tokens, completion_tokens, total_tokens, cost, estimated)
+
+        model_key = str(rec.get("model") or "(未记录)")
+        model_bucket = models.setdefault(model_key, {**_usage_bucket(), "provider_name": str(rec.get("provider_name") or "")})
+        _accumulate_usage(model_bucket, prompt_tokens, completion_tokens, total_tokens, cost, estimated)
+
+        feature_key = str(rec.get("feature") or "(未记录)")
+        feature_bucket = features.setdefault(feature_key, _usage_bucket())
+        _accumulate_usage(feature_bucket, prompt_tokens, completion_tokens, total_tokens, cost, estimated)
+    return {
+        "currency": report_currency,
+        "totals": totals,
+        "days": days,
+        "models": models,
+        "features": features,
+    }
+
 IMAGE_OUTPUT_KEY_HINTS = (
     "url", "image_url", "imageUrl", "image", "output_url", "outputUrl",
     "result_url", "resultUrl", "download_url", "downloadUrl", "asset_url", "assetUrl",
@@ -8311,6 +8662,7 @@ async def classify_image_with_provider(abs_path, provider_id="", model="", ms_mo
         provider_id or get_primary_provider_id(),
         model,
         ms_model,
+        feature="asset_classify",
     )
     classification = parse_asset_classification_text(text)
     classification["model"] = resolved_model
@@ -12424,6 +12776,7 @@ async def decide_chat_agent_action(payload, conversation, refs):
             )
             response.raise_for_status()
             raw = response.json()
+            record_llm_usage(payload.provider, model, "chat_agent_intent", usage=raw)
             decision = parse_agent_decision(text_from_chat_response(raw), payload.message, refs, has_previous_image)
             decision["router_model"] = model
             return decision
@@ -12482,6 +12835,7 @@ async def build_chat_text_reply(payload, conversation):
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"请求上游接口失败：{exc}") from exc
     raw_data = unwrap_apimart_response(raw) if isinstance(raw, dict) else raw
+    record_llm_usage(payload.provider, model, "chat_agent_text", usage=raw)
     return {
         "id": uuid.uuid4().hex,
         "role": "assistant",
@@ -16931,6 +17285,7 @@ async def canvas_llm(payload: CanvasLLMRequest):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"解析回复内容失败：{exc}") from exc
     raw_data = unwrap_apimart_response(raw) if isinstance(raw, dict) else {}
+    record_llm_usage(payload.provider, model, "canvas_llm", usage=raw)
     return {"text": text, "model": model, "raw_usage": raw_data.get("usage")}
 
 # --- 对话管理 ---
@@ -17652,6 +18007,477 @@ def find_script_cast_template(template_id: str):
     return next((item for item in items if item["id"] == target), None)
 
 
+# 人物 / 场景 / 道具三类的中文名，提示词与报错文案共用
+SCRIPT_CAST_ITEM_LABELS = {"character": "人物", "scene": "场景", "prop": "道具"}
+
+# 画风覆盖层目录：一个画风一个 .md，文件名前缀数字决定下拉框里的顺序
+SCRIPT_STYLE_DIR = os.path.join(STATIC_DIR, "system-prompts", "script-style")
+
+# 画风文件里用一行「**类别**：真人实拍」声明所属类别，给下拉框分组用（这一行不进提示词）
+SCRIPT_STYLE_CATEGORY_RE = re.compile(r"^[ \t]*\*\*类别\*\*[ \t]*[：:][ \t]*(.+?)[ \t]*$", re.MULTILINE)
+# 画风文件可选再写一行「**视频风格**：cartoon」来指定 PenShot 的视频风格；不写就按「类别」给默认值
+SCRIPT_STYLE_VIDEO_RE = re.compile(r"^[ \t]*\*\*视频风格\*\*[ \t]*[：:][ \t]*(.+?)[ \t]*$", re.MULTILINE)
+SCRIPT_VIDEO_STYLE_VALUES = {"realistic", "anime", "cinematic", "cartoon", "stylized", "ambient"}
+SCRIPT_VIDEO_STYLE_BY_CATEGORY = {
+    "真人实拍": "realistic",
+    "电影类型片": "cinematic",
+    "动画漫画": "anime",
+    "美术画种": "stylized",
+    "技术材质": "stylized",
+}
+
+
+def load_script_styles():
+    """画风列表：static/system-prompts/script-style/ 下的 .md，按文件名排序。
+
+    想加画风直接往目录里丢一个 .md 就行，代码不用动：
+    首个 `#` 标题是下拉框里的名字，「**类别**：xxx」那一行决定分组。
+    """
+    styles = []
+    try:
+        names = sorted(os.listdir(SCRIPT_STYLE_DIR))
+    except Exception:
+        names = []
+    for name in names:
+        if not name.lower().endswith(".md"):
+            continue
+        try:
+            with open(os.path.join(SCRIPT_STYLE_DIR, name), "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        except Exception as e:
+            print(f"读取画风文件失败 {name}: {e}")
+            continue
+        if not content:
+            continue
+        title = ""
+        for line in content.splitlines():
+            if line.strip().startswith("#"):
+                title = line.strip().lstrip("#").strip()
+                break
+        found = SCRIPT_STYLE_CATEGORY_RE.search(content)
+        found_video = SCRIPT_STYLE_VIDEO_RE.search(content)
+        body = content.split("\n", 1)[1] if "\n" in content else ""
+        # 描述给下拉框当悬停提示用：把标题和「**类别**」「**视频风格**」那两行去掉，只留正文
+        body = SCRIPT_STYLE_CATEGORY_RE.sub("", body)
+        body = SCRIPT_STYLE_VIDEO_RE.sub("", body)
+        styles.append({
+            "id": os.path.splitext(name)[0],
+            "name": title or os.path.splitext(name)[0],
+            "category": found.group(1).strip() if found else "其他",
+            "video_style": found_video.group(1).strip().lower() if found_video else "",
+            "description": re.sub(r"\s+", " ", body).strip()[:140],
+        })
+    return styles
+
+
+def find_script_style(style_id: str):
+    """按 id 取一份画风正文；「**类别**」那一行会去掉，它是给下拉框分组用的。"""
+    target = str(style_id or "").strip()
+    if not target:
+        return None
+    item = next((one for one in load_script_styles() if one["id"] == target), None)
+    if not item:
+        return None
+    try:
+        with open(os.path.join(SCRIPT_STYLE_DIR, target + ".md"), "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except Exception as e:
+        print(f"读取画风失败 {target}: {e}")
+        return None
+    clean = "\n".join(
+        line for line in content.splitlines() if not SCRIPT_STYLE_CATEGORY_RE.match(line)
+    ).strip()
+    return dict(item, content=clean)
+
+
+# 分镜提示词提取技能目录：一个技能一个 .md，文件名前缀数字决定下拉框里的顺序
+SCRIPT_SHOT_SKILL_DIR = os.path.join(STATIC_DIR, "system-prompts", "script-shot")
+
+# 技能必须逐字写进提示词的输出契约
+SHOT_SKILL_JSON_CONTRACT = (
+    '{"shots":[{"index":1,"duration":12,"scene":"场景名",'
+    '"characters":["角色名"],"props":["道具名"],"prompt":"..."}]}'
+)
+
+
+# 目录型技能（一个子目录 + SKILL.md）：没写 project.json 时默认拼这几份
+SHOT_SKILL_DEFAULT_INCLUDE = [
+    "SKILL.md",
+    "resources/storyboard-prompt-template.md",
+    "references/capabilities/field-spec.md",
+    "references/capabilities/shot-pacing.md",
+    "references/capabilities/camera-motion.md",
+]
+# 拼进提示词的正文总量上限（字符）：技能包可能很大，超了按清单顺序截断
+SHOT_SKILL_CONTENT_LIMIT = 200000
+
+
+def _read_text_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        print(f"读取文件失败 {path}: {e}")
+        return ""
+
+
+def _shot_skill_front_matter(content):
+    """取 SKILL.md 顶部 YAML front-matter 里的 name / description（只认这两个简单键）。"""
+    text = str(content or "")
+    if not text.startswith("---"):
+        return {}
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}
+    meta = {}
+    for line in parts[1].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if key in ("name", "description"):
+            meta[key] = value.strip().strip('"').strip("'")
+    return meta
+
+
+def _shot_skill_project_meta(dir_path):
+    """目录型技能的项目侧配置：显示名 / 类别 / 说明 / 拼装清单 / 输出适配文件。"""
+    raw = _read_text_file(os.path.join(dir_path, "project.json")).strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        print(f"解析技能配置失败 {dir_path}: {e}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _shot_skill_display_name(dir_path, meta, content):
+    """下拉框里的名字：项目配置 > front-matter name > 首个 # 标题（去掉括号里的长注解）。"""
+    name = str((meta or {}).get("display_name") or "").strip()
+    if name:
+        return name
+    fm = _shot_skill_front_matter(content)
+    if fm.get("name"):
+        return fm["name"]
+    for line in str(content or "").splitlines():
+        if line.strip().startswith("#"):
+            title = line.strip().lstrip("#").strip()
+            for cut in ("（", "("):
+                if cut in title:
+                    title = title.split(cut, 1)[0].strip()
+            return title
+    return os.path.basename(dir_path)
+
+
+def load_script_shot_skills():
+    """分镜提示词提取技能列表：static/system-prompts/script-shot/ 下的 .md 与目录型技能。
+
+    单个 .md：首个 `#` 标题是下拉框里的名字，可选一行「**类别**：xxx」决定分组。
+    目录型技能：子目录里有 SKILL.md（如从外部技能包安装进来的），
+    用同目录下的 project.json 指定显示名与要拼进提示词的文件清单。
+    """
+    skills = []
+    try:
+        names = sorted(os.listdir(SCRIPT_SHOT_SKILL_DIR))
+    except Exception:
+        names = []
+    for name in names:
+        path = os.path.join(SCRIPT_SHOT_SKILL_DIR, name)
+        if os.path.isdir(path):
+            skill_md = os.path.join(path, "SKILL.md")
+            if not os.path.exists(skill_md):
+                continue
+            content = _read_text_file(skill_md)
+            meta = _shot_skill_project_meta(path)
+            fm = _shot_skill_front_matter(content)
+            desc = str(meta.get("description") or fm.get("description") or "")
+            skills.append({
+                "id": name,
+                "name": _shot_skill_display_name(path, meta, content),
+                "category": str(meta.get("category") or "其他"),
+                "description": re.sub(r"\s+", " ", desc).strip()[:140],
+            })
+            continue
+        if not name.lower().endswith(".md"):
+            continue
+        content = _read_text_file(path).strip()
+        if not content:
+            continue
+        title = ""
+        for line in content.splitlines():
+            if line.strip().startswith("#"):
+                title = line.strip().lstrip("#").strip()
+                break
+        found = SCRIPT_STYLE_CATEGORY_RE.search(content)
+        # 描述给下拉框当悬停提示用：把标题和「**类别**」那一行去掉，只留正文
+        body = content.split("\n", 1)[1] if "\n" in content else ""
+        body = SCRIPT_STYLE_CATEGORY_RE.sub("", body)
+        skills.append({
+            "id": os.path.splitext(name)[0],
+            "name": title or os.path.splitext(name)[0],
+            "category": found.group(1).strip() if found else "其他",
+            "description": re.sub(r"\s+", " ", body).strip()[:140],
+        })
+    return skills
+
+
+def _shot_skill_dir_content(dir_path):
+    """目录型技能：按 project.json 的清单把若干文件拼成一份给模型的正文。
+
+    技能包是「入口 + 多张能力卡」的渐进式结构，整包（这里约 218KB）不能一次塞进请求；
+    按清单拼，末尾附项目侧的「输出适配」文件，把交付形态收口成我们要的 JSON。
+    """
+    meta = _shot_skill_project_meta(dir_path)
+    include = meta.get("include")
+    if not isinstance(include, list) or not include:
+        include = SHOT_SKILL_DEFAULT_INCLUDE
+    parts = []
+    total = 0
+    for rel in include:
+        rel = str(rel or "").strip().replace("\\", "/")
+        if not rel:
+            continue
+        path = os.path.join(dir_path, rel)
+        if not os.path.exists(path):
+            print(f"技能文件缺失，已跳过：{rel}")
+            continue
+        text = _read_text_file(path).strip()
+        if not text:
+            continue
+        block = f"<!-- {rel} -->\n{text}"
+        if total + len(block) > SHOT_SKILL_CONTENT_LIMIT:
+            print(f"技能正文超过上限，已截断：{rel}")
+            break
+        parts.append(block)
+        total += len(block)
+    adapter = str(meta.get("adapter") or "").strip().replace("\\", "/")
+    if adapter:
+        path = os.path.join(dir_path, adapter)
+        if os.path.exists(path):
+            text = _read_text_file(path).strip()
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts).strip()
+
+
+def find_script_shot_skill(skill_id: str):
+    """按 id 取一份技能正文；「**类别**」那一行会去掉，它是给下拉框分组用的。"""
+    target = str(skill_id or "").strip()
+    if not target:
+        return None
+    item = next((one for one in load_script_shot_skills() if one["id"] == target), None)
+    if not item:
+        return None
+    # 目录型技能（外部技能包安装进来的）：按清单拼装
+    dir_path = os.path.join(SCRIPT_SHOT_SKILL_DIR, target)
+    if os.path.isdir(dir_path) and os.path.exists(os.path.join(dir_path, "SKILL.md")):
+        content = _shot_skill_dir_content(dir_path)
+        if not content:
+            return None
+        return dict(item, content=content)
+    content = _read_text_file(os.path.join(SCRIPT_SHOT_SKILL_DIR, target + ".md")).strip()
+    if not content:
+        return None
+    clean = "\n".join(
+        line for line in content.splitlines() if not SCRIPT_STYLE_CATEGORY_RE.match(line)
+    ).strip()
+    return dict(item, content=clean)
+
+
+def build_script_shot_skill_system_prompt(template, style=None, cast_names=None, duration_limit=0.0):
+    """技能正文 + 画风 + 素材清单 + 提取时长上限 + JSON 契约：告诉模型只能用给定名字，严格出 JSON。"""
+    names = [str(name).strip() for name in (cast_names or []) if str(name or "").strip()]
+    limit = max(0.0, float(duration_limit or 0.0))
+    lines = [str(template or "").strip()]
+    style_block = script_style_block(style)
+    if style_block:
+        lines += ["", "## 画风要求（逐字遵循，优先级最高）", "", style_block]
+    lines += [
+        "",
+        "## 可用素材清单（scene / characters / props 只能填这里的名字）",
+        "",
+        "、".join(names) if names else "（本次没有提供素材清单：scene 留空字符串，characters / props 留空数组。）",
+    ]
+    if limit > 0:
+        lines += [
+            "",
+            f"## 提取时长上限（本次）：{limit:g} 秒",
+            "",
+            f"按剧本顺序自上而下提取，**累计时长达到 {limit:g} 秒就收笔**——后面的内容不要再提取；",
+            "最后一段可以略微超出一点，以保持这一件事讲完整。",
+            "（只有上限为 0 时才是「提取全部」，本次不是。）",
+        ]
+    else:
+        lines += ["", "## 提取范围：全部（不设上限）", "", "自上而下把整段剧本都提取完。"]
+    lines += [
+        "",
+        "## 严格输出格式（必须逐字遵守）",
+        "",
+        "只输出一个 JSON 对象，不要输出任何解释、前言、结语或代码块之外的文字：",
+        "",
+        SHOT_SKILL_JSON_CONTRACT,
+        "",
+        "- index 从 1 开始，按剧本顺序递增，不跳号。",
+        "- duration 是这一段视频的秒数（整数），每段 10–15 秒。",
+        "- prompt 是可直接用于 AI 视频生成的提示词（画面、镜头、动作、光线写清楚）。",
+        "- scene / characters / props 只能取自「可用素材清单」；清单里没有的留空，不要自造名字。",
+    ]
+    return "\n".join(lines)
+
+
+def build_script_shot_skill_user_prompt(script_content, notes=""):
+    tail = f"\n\n补充要求：{str(notes).strip()}" if str(notes or "").strip() else ""
+    return (
+        "以下是剧本正文，请按系统提示词的规则提取分镜提示词，严格输出约定的 JSON。\n\n"
+        "---- 剧本正文开始 ----\n"
+        f"{script_content}\n"
+        "---- 剧本正文结束 ----"
+        f"{tail}"
+    )
+
+
+def parse_shot_skill_json(text):
+    """把模型返回解析成 JSON：容忍 ```json 围栏与前后废话。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    fence = SCRIPT_FENCE_RE.search(raw)
+    if fence:
+        raw = fence.group(1).strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(raw):
+        if ch not in "[{":
+            continue
+        try:
+            obj, _end = decoder.raw_decode(raw[i:])
+            return obj
+        except Exception:
+            continue
+    return None
+
+
+def script_video_style(style_id: str) -> str:
+    """把应用里的画风换算成 PenShot 支持的视频风格值（realistic/anime/cinematic/cartoon/stylized/ambient）。
+
+    PenShot 只有这 6 种（用于提示词转换时统一风格），而应用的画风库有 36 个：
+    优先用画风文件里写的「**视频风格**：xxx」，没写就按「类别」给一个默认值。
+    """
+    item = find_script_style(style_id)
+    if not item:
+        return ""
+    override = str(item.get("video_style") or "").strip().lower()
+    if override in SCRIPT_VIDEO_STYLE_VALUES:
+        return override
+    category = str(item.get("category") or "").strip()
+    return SCRIPT_VIDEO_STYLE_BY_CATEGORY.get(category, "cinematic")
+
+
+def script_style_block(style):
+    """把一条画风压成一段固定文本。
+
+    分镜是一条条分开生成的，模型对风格的措辞和位置每次都不一样（有时独立成段，
+    有时塞进「人物站位」句子里），整批看下来就不统一。这里先在服务端把画风拼成
+    一段确定的话，让每个单元逐字照抄，风格才真正一致。
+    """
+    if not style:
+        return ""
+    positives, negatives, tail = [], [], ""
+    for raw in str(style.get("content") or "").splitlines():
+        line = raw.strip()
+        if not line.startswith("- "):
+            continue
+        item = line[2:].strip().rstrip("。")
+        if item.startswith("固定尾缀建议"):
+            tail = item.split("：", 1)[-1].strip()
+        elif item.startswith("避免"):
+            negatives.append(item.split("：", 1)[-1].strip())
+        else:
+            positives.append(item)
+    parts = []
+    if positives:
+        parts.append(f"画面风格：{style.get('name') or style.get('id')}——" + "；".join(positives) + "。")
+    if negatives:
+        parts.append("负面词：" + "；".join(negatives) + "。")
+    if tail:
+        parts.append("固定尾缀：" + tail + "。")
+    return "".join(parts)
+
+
+SCRIPT_CONTRACT_RE = re.compile(r"<!--\s*script-contract:(.*?)-->", re.DOTALL)
+
+
+def parse_script_contract(template_text):
+    """模板可以在正文任意位置用 `<!-- script-contract: 键=值; … -->` 声明自己的交付契约。
+
+    「本次交付要求」那一段是服务端拼在模板后面的，里面写死了「10–15 秒」「15秒」这类数字，
+    选了单镜只有 6–10 秒的模板（3D 漫剧半解说）也会被压回文戏的规格。
+    模板声明什么这里就按什么拼；没声明的一律保持老样子。
+    """
+    match = SCRIPT_CONTRACT_RE.search(str(template_text or ""))
+    if not match:
+        return {}
+    contract = {}
+    for part in match.group(1).split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip().lower()
+        if key:
+            contract[key] = value.strip()
+    return contract
+
+
+def script_template_for_prompt(template_text):
+    """交给模型看的模板正文：去掉那行契约标记。它是给服务端读的，模型看了只会分心。"""
+    return SCRIPT_CONTRACT_RE.sub("", str(template_text or "")).strip()
+
+
+def build_script_style_section(style, has_cast: bool = False):
+    """把选中的画风追加在提示词末尾；没选就返回空串，老行为一个字不变。
+
+    has_cast=True 时（分镜提示词会把上一步的人物与场景设定整块带进来）额外说明：
+    设定块只提供身份锚点，它里面的风格化写法要让位给本节的画风，
+    否则选了动漫 / 3D 画风，分镜提示词仍会照抄设定里的「真人实拍」。
+    """
+    if not style:
+        return ""
+    lines = [
+        "## 画风（整批共用，本节优先级最高）",
+        "",
+        f"本次统一按「{style.get('name') or style.get('id')}」出图。以下规则压倒上文一切与画风冲突的写法："
+        "模板里写死的风格、固定尾缀、负面词（例如真人写实、胶片颗粒、皮肤毛孔、"
+        "`no stylisation`，以及「否定插画 / 动漫 / 3D」这类要求）全部作废，"
+        "一律改成下面这一套；画面结构、镜头语言与输出格式保持不变。",
+    ]
+    if has_cast:
+        lines += [
+            "",
+            "- 「人物与场景设定」里只保留身份锚点：姓名、年龄、体态、脸型、眉眼、瞳色、发型、"
+            "皮肤的基础色、伤与残、标志性道具、服装款式与配色——这些事实一个都不能增删或改换。",
+            "- 该设定块里凡是风格化写法（真人实拍 / 写实 / 胶片 / 毛孔 / `no stylisation` / "
+            "否定插画·动漫·3D 等）一律不要照搬，按本节画风重写画面质感、线条、材质、光影、镜头与景深。",
+            "- 每个单元的固定尾缀与负面词只保留本节这一套，不要混入上文模板的旧尾缀。",
+        ]
+        fixed = script_style_block(style)
+        if fixed:
+            lines += [
+                "",
+                "- 每个单元的提示词里都要**逐字带上**下面这一段「画面风格」，位置固定在最后的"
+                "【禁止项】之前、单独成段；一律照抄，不要改写、不要拆散、不要并进「人物站位」那一句里，"
+                "也不要在不同单元里换措辞——**所有单元这一段必须一模一样**：",
+                "",
+                fixed,
+            ]
+    lines += ["", style.get("content") or ""]
+    return "\n".join(lines)
+
+
 def load_script_user_templates():
     """读取用户「存为常用」的剧本提示词。"""
     if not os.path.exists(SCRIPT_USER_TEMPLATE_PATH):
@@ -17774,28 +18600,40 @@ def parse_script_units(markdown: str):
     return outline, units
 
 
-def build_script_system_prompt(template: str, allow_rewrite: bool, notes: str, characters: str = ""):
+def build_script_system_prompt(template: str, allow_rewrite: bool, notes: str, characters: str = "", style=None):
     rewrite_rule = (
         "允许在不改变人物意图、笑点和关系结果的前提下压缩重复信息与冗余台词。"
         if allow_rewrite
         else "不得改写或删除原作台词，只能按自然分句拆开；容量超限时在关系转折处分段。"
     )
+    # 秒数、大纲要点都跟着所选模板走：模板声明了自己的契约（见 parse_script_contract），
+    # 就按它拼，别把 3D 漫剧那类单镜 6–10 秒的模板压回文戏的 10–15 秒。
+    contract = parse_script_contract(template)
+    unit_span = contract.get("unit-seconds") or "10–15 秒"
+    seconds_samples = contract.get("seconds-samples") or "10 / 12 / 15"
+    outline_fields = contract.get("outline-fields") or "「有效台词 / 事件 / 关系变化 / 结尾落点」"
+    # 模板自己追加的硬规则：那份 3D 漫剧模板是教程体，正文里塞了 14 个章节，
+    # 模型会照着最眼熟的文戏骨架写、把它的规矩当参考资料。所以让它在这里点名逐条重申。
+    extra_rules = [rule.strip() for rule in (contract.get("extra-rules") or "").split("|") if rule.strip()]
     lines = [
-        str(template or "").strip(),
+        script_template_for_prompt(template),
         "",
         "---",
         "",
         "## 本次交付要求（与上文冲突时以本节为准）",
         "",
-        "- 单元数量由剧本本身决定：按上文每个单元 10–15 秒的容量与拆分规则自然分段，"
+        f"- 单元数量由剧本本身决定：按上文每个单元 {unit_span}的容量与拆分规则自然分段，"
         "剧本有多少内容就输出多少个单元，不要为了凑数量而拆碎，也不要为了省事而把多段剧情硬压进一个单元。",
         "- 必须把剧本正文全部拆完，不能只输出大纲或前几个单元就停下。",
         f"- {rewrite_rule}",
         "- 只输出 Markdown，不要任何前言、结语、解释、评分或自我检查过程。",
-        "- 先输出 `# 分段大纲` 章节，条目格式严格为 `1. P01｜15秒｜段名`，每条下面缩进列出「有效台词 / 事件 / 关系变化 / 结尾落点」。",
-        "- 大纲之后，每个单元用一个二级标题独占一行，格式严格为 `## P01｜15秒｜段名`。",
-        "- 每个单元标题之后，紧接着用一个 ```text 代码块包裹该单元的完整提示词正文：从 `<Subject1>...` 开始，到最后的【强制声明】那一段结束。",
+        f"- 先输出 `# 分段大纲` 章节，条目格式严格为 `1. P01｜12秒｜段名`，每条下面缩进列出{outline_fields}。",
+        "- 大纲之后，每个单元用一个二级标题独占一行，格式严格为 `## P01｜12秒｜段名`。",
+        f"- 标题里 `P01` 后面的秒数写该单元**实际**的时长，逐条按内容长短取不同值（例如 {seconds_samples} 秒），"
+        "不要全篇都写同一个数字。",
+        "- 每个单元标题之后用一个 ```text 代码块包裹该单元的完整提示词正文：从 `<Subject1>...` 开始，到最后的【强制声明】那一段结束。",
         "- 代码块内只放提示词正文，不要单元标题、编号、说明或额外注释；台词必须是中文。",
+        *[f"- {rule}" for rule in extra_rules],
         "- 不要输出「填写规则」「生成前引导流程」「交付前检查」等模板说明章节，也不要保留方括号占位符。",
     ]
     if str(characters or "").strip():
@@ -17813,6 +18651,10 @@ def build_script_system_prompt(template: str, allow_rewrite: bool, notes: str, c
         ]
     if str(notes or "").strip():
         lines += ["", "## 用户补充要求", "", str(notes).strip()]
+    # 分镜会把人物与场景设定整块带上，所以要把 has_cast 传进去，让画风盖过设定里的写实写法
+    style_section = build_script_style_section(style, has_cast=bool(str(characters or "").strip()))
+    if style_section:
+        lines += ["", style_section]
     return "\n".join(lines)
 
 
@@ -17834,10 +18676,15 @@ def build_script_user_prompt(script_content: str, characters: str = ""):
     )
 
 
-def build_script_chat_system_prompt(template: str, characters: str = ""):
+def build_script_chat_system_prompt(template: str, characters: str = "", style=None):
     """对话式补分镜：沿用同一套分镜模板，但只让它补新的那几条。"""
+    # 和「开始生成」同源：秒数、大纲要点都按所选模板自己的契约走
+    contract = parse_script_contract(template)
+    unit_span = contract.get("unit-seconds") or "10–15 秒"
+    seconds_samples = contract.get("seconds-samples") or "10 / 12 / 15"
+    extra_rules = [rule.strip() for rule in (contract.get("extra-rules") or "").split("|") if rule.strip()]
     lines = [
-        str(template or "").strip(),
+        script_template_for_prompt(template),
         "",
         "---",
         "",
@@ -17847,12 +18694,15 @@ def build_script_chat_system_prompt(template: str, characters: str = ""):
         "",
         "- 只输出新增的分镜，不要重复已有分镜里已经写过的内容，也不要把整本剧本重拆一遍。",
         "- 条数按用户的要求来：要几条就写几条；用户没说条数时，按内容需要写 1–3 条。",
-        "- 每条新分镜都要完整可用：按上文模板与拆分规则写，每个单元同样按 10–15 秒的容量。",
+        f"- 每条新分镜都要完整可用：按上文模板与拆分规则写，每个单元同样按 {unit_span}的容量。",
         "- 编号从 P01 开始顺排即可（P01、P02、P03…）：真正插进分镜表时的编号由页面决定，不用管。",
-        "- 每条分镜用一个二级标题独占一行，格式严格为 `## P01｜15秒｜段名`。",
-        "- 标题之后紧接着用一个 ```text 代码块包裹该条的完整提示词正文："
+        "- 每条分镜用一个二级标题独占一行，格式严格为 `## P01｜12秒｜段名`。",
+        f"- 标题里 `P01` 后面的秒数写该条**实际**的时长，逐条按内容长短取不同值（例如 {seconds_samples} 秒），"
+        "不要每条都写同一个数字。",
+        "- 标题之后用一个 ```text 代码块包裹该条的完整提示词正文："
         "从 `<Subject1>...` 开始，到最后的【强制声明】那一段结束。",
         "- 代码块内只放提示词正文，不要编号、说明或额外注释；台词必须是中文。",
+        *[f"- {rule}" for rule in extra_rules],
         "- 只输出这些分镜的 Markdown，不要前言、结语、解释、评分或自我检查过程。",
         "- 如果用户这句话不是要新分镜（只是在讨论、追问、提修改意见），"
         "就用几句简短中文回答，不要硬凑成分镜格式。",
@@ -17870,6 +18720,9 @@ def build_script_chat_system_prompt(template: str, characters: str = ""):
             "- 设定若为英文（面向出图平台写成），请把这些事实准确翻译成中文写进新分镜："
             "不要照抄英文原句，也不要把负面词、固定尾缀、代码块搬进来，但已给定的属性一个都不能增删或改换。",
         ]
+    style_section = build_script_style_section(style)
+    if style_section:
+        lines += ["", style_section]
     return "\n".join(lines)
 
 
@@ -17884,7 +18737,16 @@ def build_script_chat_user_prompt(script_content: str, units, instruction: str):
         for unit in summary[:800]:
             code = str(unit.get("code") or "").strip()
             name = str(unit.get("name") or "").strip()
-            lines.append(f"- {code} {name}".rstrip())
+            text = str(unit.get("text") or "").strip()
+            if not text:
+                lines.append(f"- {code} {name}".rstrip())
+                continue
+            # 带正文时给出头尾两段：判断「相邻两镜中间缺没缺过渡」看的正是上一镜的落点和下一镜的起点
+            head = text[:220]
+            tail = text[-220:] if len(text) > 440 else ""
+            lines.append(f"### {code} {name}".rstrip())
+            lines.append(head + (f"\n…\n{tail}" if tail else ""))
+            lines.append("")
         if len(summary) > 800:
             lines.append(f"- …（还有 {len(summary) - 800} 条，未全部列出）")
         lines.append("")
@@ -17900,9 +18762,9 @@ def build_script_chat_user_prompt(script_content: str, units, instruction: str):
     return "\n".join(lines)
 
 
-def build_script_cast_system_prompt(template: str, only: str = ""):
-    """only="prop" 时只出道具，人物与场景一个字都不动（已生成的参考图靠提示词匹配，
-    重写人物/场景会把那些图全冲掉）。"""
+def build_script_cast_system_prompt(template: str, only: str = "", style=None):
+    """only 传某一类时只出那一类，另外两类一个字都不动（已生成的参考图靠提示词匹配，
+    重写别的部分会把那些图全冲掉）。"""
     lines = [
         str(template or "").strip(),
         "",
@@ -17914,7 +18776,23 @@ def build_script_cast_system_prompt(template: str, only: str = ""):
         "上文提到的「找素材真源」「列章节检索」「出图节奏」「读回图片核对」等步骤一律跳过。",
         "- 直接完成提取与写作，不要反问、不要要求用户补充信息、不要输出计划或确认环节。",
     ]
-    if only == "prop":
+    if only == "character":
+        lines += [
+            "- 这次**只提取人物**：不要输出场景清单、场景图，也不要输出道具清单、道具图，只输出人物相关的两节。",
+            "- 输出结构固定为两节：先 `## 人物清单`（一行一个角色，写清姓名与身份），"
+            "再逐个角色给出其完整提示词。",
+            "- 每个角色必须有：主体段（含至少一条只有背面或侧面才看得到的特征）、固定尾缀、对应负面词。"
+            "同一批角色使用同一个版式、同一套尾缀，逐字一致。",
+        ]
+    elif only == "scene":
+        lines += [
+            "- 这次**只提取场景**：不要输出人物清单、人物三视图，也不要输出道具清单、道具图，只输出场景相关的两节。",
+            "- 输出结构固定为两节：先 `## 场景清单`（一行一个场景，写清名称与它在剧情里的作用），"
+            "再逐个场景给出其完整提示词。",
+            "- 每个场景标明类别（概念图 / 气氛图 / 名场面图），给出完整提示词与场景负面词；概念图里的人必须不可辨识。"
+            "同一批场景使用同一套尾缀，逐字一致。",
+        ]
+    elif only == "prop":
         lines += [
             "- 这次**只提取道具**：不要输出人物清单、人物三视图，也不要输出场景清单、场景图，"
             "只输出道具相关的两节。",
@@ -17939,11 +18817,14 @@ def build_script_cast_system_prompt(template: str, only: str = ""):
         "- 不要输出「填写规则」「生成前引导流程」「交付前检查清单」「参数对照表」「常见失败与修法」等模板说明章节。",
         "- 只输出 Markdown 正文，不要前言、结语、解释或自我检查过程。",
     ]
+    style_section = build_script_style_section(style)
+    if style_section:
+        lines += ["", style_section]
     return "\n".join(lines)
 
 
 def build_script_cast_user_prompt(script_content: str, only: str = ""):
-    target = "道具" if only == "prop" else "人物与场景"
+    target = SCRIPT_CAST_ITEM_LABELS.get(only, "人物与场景")
     return (
         f"以下是剧本正文，请按系统提示词的规则提取其中的{target}，"
         "输出可直接交给出图平台使用的完整提示词。\n\n"
@@ -17951,6 +18832,124 @@ def build_script_cast_user_prompt(script_content: str, only: str = ""):
         f"{script_content}\n"
         "---- 剧本正文结束 ----"
     )
+
+
+def build_script_cast_item_system_prompt(template: str, kind: str, title: str, style=None):
+    """只重写清单里的某一条：别的条目、别的类型一个字都不动。"""
+    label = SCRIPT_CAST_ITEM_LABELS[kind]
+    lines = [
+        str(template or "").strip(),
+        "",
+        "---",
+        "",
+        f"## 本次任务：只重写一条{label}提示词（与上文冲突时以本节为准）",
+        "",
+        "- 素材来源只有下方用户消息里的剧本正文与这一条的上一版提示词，没有别的文件："
+        "上文提到的「找素材真源」「列章节检索」「出图节奏」「读回图片核对」等步骤一律跳过。",
+        "- 直接完成改写，不要反问、不要要求用户补充信息、不要输出计划或确认环节。",
+        f"- 只重写 `{title}` 这**一条**{label}的提示词；清单里的其它条目、其它类型一律不要输出。",
+        "- 不要输出任何 `##` / `###` 章节标题，也不要输出清单："
+        "只输出一个 ```text 代码块，里面就是这一条完整的提示词正文。",
+        "- 版式与固定尾缀必须跟上一版保持一致：固定尾缀与负面词逐字沿用，不要另起一套。",
+        "- 上一版里准确的事实（姓名拼音、年龄、外观锚点、伤与残、标志性道具）可以保留，"
+        "但主体段要重写得更具体、更有画面依据，不要整段照抄。",
+        "- 代码块里不留任何 `[方括号占位]`，代码块外不要写解释。",
+    ]
+    style_section = build_script_style_section(style)
+    if style_section:
+        lines += ["", style_section]
+    return "\n".join(lines)
+
+
+def build_script_cast_item_user_prompt(script_content: str, kind: str, title: str, prompt: str):
+    label = SCRIPT_CAST_ITEM_LABELS[kind]
+    return (
+        f"要重写的是这一条{label}：`{title}`。\n\n"
+        "---- 这一条的上一版提示词开始 ----\n"
+        f"{str(prompt or '').strip()}\n"
+        "---- 这一条的上一版提示词结束 ----\n\n"
+        f"以下是剧本正文，用来核对 `{title}` 的事实：\n\n"
+        "---- 剧本正文开始 ----\n"
+        f"{script_content}\n"
+        "---- 剧本正文结束 ----"
+    )
+
+
+def build_script_cast_missing_system_prompt(template: str, style=None):
+    """只补清单里漏掉的条目：已有的条目、已有的参考图一个字都不动。
+
+    返回的是一段 Markdown 片段，前端按二级标题切回人物/场景/道具三个框，
+    再用「项目符号行插进清单段 + `###` 块追加到末尾」的方式合并，
+    所以这里必须保留 `##` / `###` + 代码块的完整结构，不能被压成纯文本。
+    """
+    lines = [
+        str(template or "").strip(),
+        "",
+        "---",
+        "",
+        "## 本次任务：只补清单里漏掉的条目（与上文冲突时以本节为准）",
+        "",
+        "- 素材来源只有下方用户消息里的剧本正文、已有清单与已生成分镜的实体声明，没有别的文件："
+        "上文提到的「找素材真源」「列章节检索」「出图节奏」「读回图片核对」等步骤一律跳过。",
+        "- 直接完成提取与写作，不要反问、不要要求用户补充信息、不要输出计划或确认环节。",
+        "- 这次**只补漏**：把剧本正文与已生成分镜里出现、但「已有清单」里**没有登记**的人物、场景、道具找出来，"
+        "只输出这些新增条目。**已有清单里已经有的条目，一个都不要重复输出**（同一个名字换个写法也算已有）。",
+        "- **不许凭空造名字**：分镜里写出的每个名字都必须能在剧本正文里找到依据；剧本与分镜里都没出现的角色、场景、道具，"
+        "一律不要输出。宁可少补，也不要编。",
+        "- 输出结构（按类分段，段与段之间空一行）：",
+        "  1. 先一段 `## 人物清单`，里面**只写这次新增角色的项目符号行**，格式与已有清单逐字一致"
+        "（例如 `- **中文（English）**——身份与出场位置`）；然后逐个新增角色给一个 `### 中文（English）` 标题"
+        "加一个 ```text 代码块，块内是该角色的完整提示词正文。",
+        "  2. 再一段 `## 场景清单`，同样只写新增场景的项目符号行与 `### 标题` + 代码块。",
+        "  3. 最后一段 `## 道具清单`，同样只写新增道具的项目符号行与 `### 标题` + 代码块。",
+        "- **某一类没有漏掉的，整段都不要输出**——连 `## 人物清单` 这个标题也不要写。三类都没有漏掉时，"
+        "只回复一行 `无`。",
+        "- 新增条目的版式、固定尾缀与负面词，必须与「已有清单」里同类条目**逐字一致**，沿用同一套，不要另起一套。",
+        "- 人物条目按「三视图模板」写：主体段（含至少一条只有背面或侧面才看得到的特征）+ 固定尾缀 + 对应负面词。",
+        "- 场景条目标明类别（概念图 / 气氛图 / 名场面图），给出完整提示词与场景负面词；概念图里的人必须不可辨识。",
+        "- 道具条目按「道具图模板」写：画面里不得出现任何人的痕迹（无手、无指头、无模特、无人影），"
+        "平色无缝底、匀光、无强烈投影；写死材质、磨损位置、颜色与主色调，以及刻字或标识内容（没有就写 plain and unmarked）。",
+        "- 代码块里不留任何 `[方括号占位]`；代码块之外只允许有清单项目符号行与 `##` / `###` 标题，不要写解释、评分或自我检查。",
+        "- 不要输出「填写规则」「生成前引导流程」「交付前检查清单」「参数对照表」「常见失败与修法」等模板说明章节。",
+    ]
+    style_section = build_script_style_section(style)
+    if style_section:
+        lines += ["", style_section]
+    return "\n".join(lines)
+
+
+def build_script_cast_missing_user_prompt(
+    script_content: str,
+    characters: str = "",
+    scenes: str = "",
+    props: str = "",
+    storyboard_digest: str = "",
+):
+    parts = ["下面是这一次要用到的全部材料。请按系统提示词的规则，只补出漏掉的条目。\n"]
+
+    def section(title: str, body: str) -> None:
+        text = str(body or "").strip()
+        if not text:
+            text = "（这一类目前是空的，没有任何已登记的条目。）"
+        parts.append(f"---- 已有的{title}开始 ----\n{text}\n---- 已有的{title}结束 ----\n")
+
+    section("人物清单", characters)
+    section("场景清单", scenes)
+    section("道具清单", props)
+
+    digest = str(storyboard_digest or "").strip()
+    parts.append(
+        "---- 已生成分镜里的实体声明开始 ----\n"
+        f"{digest or '（这次没有可用的分镜，只按剧本正文判断。）'}\n"
+        "---- 已生成分镜里的实体声明结束 ----\n"
+    )
+
+    parts.append(
+        "---- 剧本正文开始 ----\n"
+        f"{script_content}\n"
+        "---- 剧本正文结束 ----"
+    )
+    return "\n".join(parts)
 
 
 class ScriptGenerateRequest(BaseModel):
@@ -17962,6 +18961,8 @@ class ScriptGenerateRequest(BaseModel):
     script: str = ""
     notes: str = ""
     characters: str = ""
+    # 画风 id（static/system-prompts/script-style/ 下的文件名），留空＝不加画风节
+    style_id: str = ""
     allow_rewrite: bool = False
 
 
@@ -17975,6 +18976,7 @@ class ScriptChatRequest(BaseModel):
     template_text: str = ""
     script: str = ""
     characters: str = ""
+    style_id: str = ""
     # 已有分镜的摘要（code / name），只为了告诉模型哪些内容已经拆过、不要重复
     units: List[dict] = []
     # 本次用户说的话
@@ -17996,13 +18998,92 @@ class ScriptCastRequest(BaseModel):
     template_id: str = ""
     template_text: str = ""
     script: str = ""
-    # 留空＝照旧一同提取人物与场景；"prop"＝只提取道具，人物与场景不动
+    # 留空＝照旧一同提取人物与场景；character / scene / prop＝只提取那一类，另外两类不动
     kind: str = ""
+    style_id: str = ""
+
+
+class ScriptShotExtractRequest(BaseModel):
+    """第六步：用项目内的提示词技能从剧本正文里提取分镜提示词（只追加，不覆盖已有分镜）。"""
+
+    provider: str = ""
+    model: str = ""
+    ms_model: str = ""
+    script: str = ""
+    # 用哪个技能（static/system-prompts/script-shot/ 下的文件名）
+    skill_id: str = ""
+    style_id: str = ""
+    # 补充要求（可选）
+    notes: str = ""
+    # 当前人物 / 场景 / 道具清单里的名字：模型只能用这些名字
+    cast_names: List[str] = []
+    # 提取时长上限（秒）：按已提取分镜的累计时长停止，取到上限就不再往下提取；0 = 提取全部
+    duration_limit: float = 0.0
+
+
+class ScriptCastItemRequest(BaseModel):
+    """只重写人物/场景/道具里某一条的提示词（卡片上的「重新生成提示词」）。"""
+
+    provider: str = ""
+    model: str = ""
+    ms_model: str = ""
+    template_id: str = ""
+    template_text: str = ""
+    script: str = ""
+    style_id: str = ""
+    # character / scene / prop
+    kind: str = ""
+    # 要重写的那一条的条目名，如「秦烬」
+    title: str = ""
+    # 这一条现在的提示词，作为上一版参考
+    prompt: str = ""
+
+
+class ScriptCastMissingRequest(BaseModel):
+    """只补清单里漏掉的条目（卡片上的「检查漏掉的人物/场景/道具」）。
+
+    已有的条目一个字都不动：返回的只是新增条目的 Markdown 片段，由前端追加。
+    """
+
+    provider: str = ""
+    model: str = ""
+    ms_model: str = ""
+    template_id: str = ""
+    template_text: str = ""
+    script: str = ""
+    style_id: str = ""
+    # 现有的三类清单 Markdown 原文：用来避免重复、并沿用同一套版式与固定尾缀
+    characters: str = ""
+    scenes: str = ""
+    props: str = ""
+    # 已生成分镜里抽出来的实体声明摘要（每行一条，前端从 <Subject…> 行去重得到）
+    storyboard_digest: str = ""
 
 
 class ScriptTemplateSaveRequest(BaseModel):
     name: str = ""
     content: str = ""
+
+
+class ScriptPenshotRequest(BaseModel):
+    """第五步：PenShot 多智能体管线（解析 / 分镜 / 校验）。
+
+    复用页面已选的 API 平台与模型；script_id 传当前剧本 id，跨批次复用记忆与一致性。
+    """
+
+    provider: str = ""
+    model: str = ""
+    ms_model: str = ""
+    script: str = ""
+    style_id: str = ""
+    # 当前剧本 id（如 sp_xxx），保证同一份剧本的多批任务共享记忆
+    script_id: str = ""
+    # 视频片段时长区间（秒），默认对齐 MiniMax H3 的 10–15 秒
+    min_duration: float = 10.0
+    max_duration: float = 15.0
+    # 提取时长上限（秒）：按「已提取的分镜（视频提示词）累计时长」停止，取到上限就收尾，不再等后面的阶段。
+    # 0 表示不限——一直提取到所有视频提示词全部产出完成。
+    duration_limit: float = 0.0
 
 
 class ScriptSaveItemRequest(BaseModel):
@@ -18041,8 +19122,14 @@ class ScriptProjectSaveRequest(BaseModel):
     cast_scenes: str = ""
     cast_props: str = ""
     cast_state: dict = {}
+    # 选中的画风 id（static/system-prompts/script-style/ 下的文件名）；换剧本时还原
+    style_id: str = ""
     results: List[dict] = []
     session: Optional[dict] = None
+    # 第五步 PenShot 管线的片段结果：按剧本各存各的，切剧本跟着走（老数据没有就是空）
+    penshot: dict = {}
+    # 第六步 技能提取的分镜提示词结果：按剧本各存各的，切剧本跟着走（老数据没有就是空）
+    shot_skill: dict = {}
     # 只有页面上的「清空」按钮才置真：允许这次保存把已有的分镜整份清掉
     allow_clear: bool = False
 
@@ -18085,22 +19172,35 @@ async def save_script_template(payload: ScriptTemplateSaveRequest):
     return {"template": saved, "templates": load_script_prompt_templates()}
 
 
+@app.get("/api/script/styles")
+async def list_script_styles():
+    """画风下拉框的选项：static/system-prompts/script-style/ 下的 .md。"""
+    return {"styles": load_script_styles()}
+
+
 @app.get("/api/script/cast-templates")
 async def list_script_cast_templates():
     return {"templates": load_script_cast_templates()}
 
 
+@app.get("/api/script/shot-skills")
+async def list_script_shot_skills():
+    """分镜提取技能下拉框的选项：static/system-prompts/script-shot/ 下的 .md。"""
+    return {"skills": load_script_shot_skills()}
+
+
 @app.post("/api/script/cast")
 async def generate_script_cast(payload: ScriptCastRequest):
-    """第一步：从剧本里提取人物与场景提示词，供后续分镜提示词沿用。
+    """第一步：从剧本里提取人物、场景与道具提示词，供后续分镜提示词沿用。
 
-    payload.kind = "prop" 时只提取道具，人物与场景原样不动。
+    payload.kind = "character" / "scene" / "prop" 时只提取那一类，另外两类原样不动。
     """
     script = str(payload.script or "").strip()
     if not script:
         raise HTTPException(status_code=400, detail="请先上传或粘贴剧本。")
 
-    only = "prop" if str(payload.kind or "").strip().lower() == "prop" else ""
+    kind = str(payload.kind or "").strip().lower()
+    only = kind if kind in SCRIPT_CAST_ITEM_LABELS else ""
     template = str(payload.template_text or "").strip()
     if not template:
         template = (find_script_cast_template(payload.template_id) or {}).get("content") or ""
@@ -18109,7 +19209,7 @@ async def generate_script_cast(payload: ScriptCastRequest):
 
     chat_base, chat_headers, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
     api_provider = get_api_provider(payload.provider or "")
-    system_prompt = build_script_cast_system_prompt(template, only)
+    system_prompt = build_script_cast_system_prompt(template, only, find_script_style(payload.style_id))
 
     async def stream():
         yield sse_event({
@@ -18117,7 +19217,7 @@ async def generate_script_cast(payload: ScriptCastRequest):
             "model": model,
             "provider": api_provider.get("name") or api_provider.get("id"),
         })
-        yield sse_event({"type": "cast_start", "kind": only or "character"})
+        yield sse_event({"type": "cast_start", "kind": only})
         async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
             try:
                 response = await client.post(
@@ -18152,6 +19252,8 @@ async def generate_script_cast(payload: ScriptCastRequest):
                 yield sse_event({"type": "cast_error", "detail": "上游返回的不是合法 JSON。"})
                 yield sse_event({"type": "done"})
                 return
+            record_llm_usage(payload.provider, model, "script_cast", usage=data,
+                             prompt_text=script, completion_text=text_from_chat_response(data))
             content = text_from_chat_response(data)
             if not str(content or "").strip():
                 finish_reason = ((data.get("choices") or [{}])[0] or {}).get("finish_reason") or ""
@@ -18167,10 +19269,1084 @@ async def generate_script_cast(payload: ScriptCastRequest):
             yield sse_event({
                 "type": "cast_done",
                 "content": content,
-                # 前端按这个决定写进哪个文本框：这次只出道具，就别碰人物/场景那两个框
-                "kind": only or "character",
+                # 前端按这个决定写进哪个文本框：这次只出一类，就别碰另外两类的框
+                "kind": only,
                 "truncated": (((data.get("choices") or [{}])[0] or {}).get("finish_reason") == "length"),
             })
+        yield sse_event({"type": "done"})
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.post("/api/script/shot-extract")
+async def extract_script_shots(payload: ScriptShotExtractRequest):
+    """第六步：用项目内的提示词技能从剧本正文里提取分镜提示词。
+
+    只返回提取结果，覆盖与否交给前端（前端只追加、绝不覆盖已有分镜）。
+    """
+    script = str(payload.script or "").strip()
+    if not script:
+        raise HTTPException(status_code=400, detail="请先上传或粘贴剧本正文。")
+
+    skill = find_script_shot_skill(payload.skill_id)
+    if not skill or not str(skill.get("content") or "").strip():
+        raise HTTPException(status_code=400, detail="未找到可用的分镜提取技能。")
+
+    chat_base, chat_headers, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
+    api_provider = get_api_provider(payload.provider or "")
+    # 提取时长上限：按累计提取时长停止；0 = 提取全部
+    duration_limit = max(0.0, float(payload.duration_limit or 0.0))
+    system_prompt = build_script_shot_skill_system_prompt(
+        skill.get("content"), find_script_style(payload.style_id), payload.cast_names, duration_limit
+    )
+
+    async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
+        try:
+            response = await client.post(
+                f"{chat_base}/chat/completions",
+                headers=chat_headers,
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": build_script_shot_skill_user_prompt(script, payload.notes)},
+                    ],
+                    "stream": False,
+                    "max_tokens": SCRIPT_GENERATE_MAX_TOKENS,
+                },
+            )
+        except httpx.HTTPError as exc:
+            log_net_error("分镜技能提取", exc)
+            raise HTTPException(status_code=502, detail=f"网络错误：{type(exc).__name__}: {exc}")
+        if response.status_code >= 400:
+            friendly = friendly_chat_error_detail(response.text, model, api_provider)
+            raise HTTPException(status_code=502, detail=friendly or f"上游接口错误：{response.text[:500]}")
+        try:
+            data = response.json()
+        except Exception:
+            raise HTTPException(status_code=502, detail="上游返回的不是合法 JSON。")
+
+    record_llm_usage(payload.provider, model, "script_shot", usage=data,
+                     prompt_text=script, completion_text=text_from_chat_response(data))
+    parsed = parse_shot_skill_json(text_from_chat_response(data))
+    shots = parsed.get("shots") if isinstance(parsed, dict) else None
+    if not isinstance(shots, list):
+        raise HTTPException(status_code=502, detail="模型没有返回可解析的分镜 JSON，请重试或更换技能 / 模型。")
+    clean_shots = [shot for shot in shots if isinstance(shot, dict)]
+    # 兜底：模型可能多写，按累计时长截断到上限，保证「取到上限就停」
+    if duration_limit > 0:
+        clean_shots = _penshot_trim_to_duration(clean_shots, duration_limit)
+    return {
+        "shots": clean_shots,
+        "skill_id": skill.get("id"),
+        "model": model,
+        "provider": api_provider.get("name") or api_provider.get("id"),
+        "duration_limit": duration_limit,
+        "extracted_duration": _fragments_total_duration(clean_shots),
+    }
+
+
+@app.post("/api/script/cast-item")
+async def regenerate_script_cast_item(payload: ScriptCastItemRequest):
+    """只重写人物/场景/道具里某一条的提示词（卡片上的「重新生成提示词」）。
+
+    提示词一变，这一条之前出的参考图就跟设定对不上了：前端会判它失效，需要再点「重新生成素材」。
+    """
+    kind = str(payload.kind or "").strip().lower()
+    if kind not in SCRIPT_CAST_ITEM_LABELS:
+        raise HTTPException(status_code=400, detail="只能重写人物、场景或道具里的一条。")
+    title = str(payload.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="没找到要重写的那一条。")
+    script = str(payload.script or "").strip()
+    if not script:
+        raise HTTPException(status_code=400, detail="请先上传或粘贴剧本。")
+
+    template = str(payload.template_text or "").strip()
+    if not template:
+        template = (find_script_cast_template(payload.template_id) or {}).get("content") or ""
+    if not template.strip():
+        raise HTTPException(status_code=400, detail="未找到可用的提取模板。")
+
+    chat_base, chat_headers, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
+    api_provider = get_api_provider(payload.provider or "")
+    system_prompt = build_script_cast_item_system_prompt(
+        template, kind, title, find_script_style(payload.style_id)
+    )
+    user_prompt = build_script_cast_item_user_prompt(script, kind, title, payload.prompt)
+
+    async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
+        try:
+            response = await client.post(
+                f"{chat_base}/chat/completions",
+                headers=chat_headers,
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "stream": False,
+                    "max_tokens": SCRIPT_GENERATE_MAX_TOKENS,
+                },
+            )
+        except httpx.HTTPError as exc:
+            log_net_error("单条提示词重写", exc)
+            raise HTTPException(status_code=502, detail=f"网络错误：{type(exc).__name__}: {exc}")
+    if response.status_code >= 400:
+        friendly = friendly_chat_error_detail(response.text, model, api_provider)
+        raise HTTPException(status_code=502, detail=friendly or f"上游接口错误：{response.text[:500]}")
+    try:
+        data = response.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="上游返回的不是合法 JSON。")
+    record_llm_usage(payload.provider, model, "script_cast_item", usage=data,
+                     prompt_text=script, completion_text=text_from_chat_response(data))
+    content = text_from_chat_response(data)
+    if not str(content or "").strip():
+        raise HTTPException(status_code=502, detail="模型没有返回内容，请重试或更换模型。")
+    # 只要代码块里的正文；模型偶尔多写几句解释，别把它混进提示词
+    blocks = [block.strip() for block in SCRIPT_FENCE_RE.findall(content) if block.strip()]
+    prompt = blocks[0] if blocks else str(content).strip()
+    return {"title": title, "kind": kind, "prompt": prompt}
+
+
+@app.post("/api/script/cast-missing")
+async def complete_missing_script_cast(payload: ScriptCastMissingRequest):
+    """只补清单里漏掉的人物/场景/道具（卡片上的「检查漏掉的人物/场景/道具」）。
+
+    返回的是新增条目的 Markdown 片段（`## 清单` + `### 标题` + 代码块），
+    前端按二级标题切回三个文本框追加；已有条目与已出的参考图一律不动。
+    """
+    script = str(payload.script or "").strip()
+    if not script:
+        raise HTTPException(status_code=400, detail="请先上传或粘贴剧本。")
+
+    existing = {
+        "characters": str(payload.characters or ""),
+        "scenes": str(payload.scenes or ""),
+        "props": str(payload.props or ""),
+    }
+    if not "".join(existing.values()).strip():
+        raise HTTPException(status_code=400, detail="还没有已生成的人物、场景与道具，先点「生成人物、场景与道具」。")
+
+    template = str(payload.template_text or "").strip()
+    if not template:
+        template = (find_script_cast_template(payload.template_id) or {}).get("content") or ""
+    if not template.strip():
+        raise HTTPException(status_code=400, detail="未找到可用的提取模板。")
+
+    chat_base, chat_headers, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
+    api_provider = get_api_provider(payload.provider or "")
+    system_prompt = build_script_cast_missing_system_prompt(template, find_script_style(payload.style_id))
+    user_prompt = build_script_cast_missing_user_prompt(
+        script,
+        existing["characters"],
+        existing["scenes"],
+        existing["props"],
+        payload.storyboard_digest,
+    )
+
+    async def stream():
+        yield sse_event({
+            "type": "meta",
+            "model": model,
+            "provider": api_provider.get("name") or api_provider.get("id"),
+        })
+        yield sse_event({"type": "missing_start"})
+        async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
+            try:
+                response = await client.post(
+                    f"{chat_base}/chat/completions",
+                    headers=chat_headers,
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "stream": False,
+                        "max_tokens": SCRIPT_GENERATE_MAX_TOKENS,
+                    },
+                )
+            except httpx.HTTPError as exc:
+                log_net_error("补漏条目", exc)
+                yield sse_event({"type": "missing_error", "detail": f"网络错误：{type(exc).__name__}: {exc}"})
+                yield sse_event({"type": "done"})
+                return
+            if response.status_code >= 400:
+                friendly = friendly_chat_error_detail(response.text, model, api_provider)
+                yield sse_event({
+                    "type": "missing_error",
+                    "detail": friendly or f"上游接口错误：{response.text[:500]}",
+                })
+                yield sse_event({"type": "done"})
+                return
+            try:
+                data = response.json()
+            except Exception:
+                yield sse_event({"type": "missing_error", "detail": "上游返回的不是合法 JSON。"})
+                yield sse_event({"type": "done"})
+                return
+            record_llm_usage(payload.provider, model, "script_cast_missing", usage=data,
+                             prompt_text=script, completion_text=text_from_chat_response(data))
+            content = text_from_chat_response(data)
+            if not str(content or "").strip():
+                finish_reason = ((data.get("choices") or [{}])[0] or {}).get("finish_reason") or ""
+                detail = "模型没有返回内容，请重试或更换模型。"
+                if finish_reason == "length":
+                    detail = (
+                        f"模型输出被截断（已达 {SCRIPT_GENERATE_MAX_TOKENS} token 上限），思维链占满了额度。"
+                        "请提高 SCRIPT_GENERATE_MAX_TOKENS，或换用非推理模型。"
+                    )
+                yield sse_event({"type": "missing_error", "detail": detail})
+                yield sse_event({"type": "done"})
+                return
+            yield sse_event({
+                "type": "missing_done",
+                "content": content,
+                "truncated": (((data.get("choices") or [{}])[0] or {}).get("finish_reason") == "length"),
+            })
+        yield sse_event({"type": "done"})
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+# ==================== 第五步：PenShot 多智能体管线（解析 / 分镜导演 / 校验） ====================
+# PenShot（story-shot-agent）把「剧本解析 → 镜头拆分 → 视频分段 → 提示词转换 → 质量审查」
+# 串成一条 LangGraph 管线，三个 Agent 就是同一条管线的阶段。这里进程内直调：
+# 用页面已选的平台/模型喂 LLM，片段时长对齐 MiniMax H3 的 10–15 秒。
+PENSHOT_TERMINAL_STATES = {"success", "failed", "cancelled", "not_found", "timeout"}
+# 非 OpenAI 兼容的协议没法直接喂给 PenShot 的 LangChain OpenAI 客户端
+PENSHOT_UNSUPPORTED_PROTOCOLS = {"gemini", "volcengine", "runninghub"}
+PENSHOT_MAX_WAIT = 1800.0
+_PENSHOT_AGENTS: Dict[str, Any] = {}
+_PENSHOT_AGENT_LOCK = Lock()
+
+
+def _penshot_prepare_import():
+    """让 penshot 能在没有 Redis 的机器上导入。
+
+    penshot 0.3.8 在 import 期就会构造 Redis 客户端（记忆配置的类体默认值、任务仓库的
+    __init__），本机没有 Redis 时直接抛 ConnectionError 导致 import 失败。这里在导入前
+    用内存实现顶掉 penshot.utils.redis_utils：记忆落到内存 + 文件，任务落到进程内字典。
+    真正部署了 Redis 的话，删掉这个替身即可恢复原生行为。
+    """
+    import types
+
+    name = "penshot.utils.redis_utils"
+    if name in sys.modules:
+        return
+
+    shim = types.ModuleType(name)
+
+    class _NoRedisClient:
+        def __init__(self, connection_url=None):
+            self.connection_url = connection_url or ""
+            self.client = None
+
+        def get_client(self):
+            return None
+
+        def close(self):
+            pass
+
+    shim.RedisClient = _NoRedisClient
+    # 空串 = 没配 Redis：短期记忆自动走内存 + 文件持久化
+    shim.get_redis_url = lambda: ""
+    sys.modules[name] = shim
+
+
+def _penshot_force_openai_compatible():
+    """聚合平台（comfly 等）的域名不在 PenShot 的识别表里，会被默认判成 Ollama。
+
+    这里只把「认不出、又不是本地 Ollama」的情况改判为 OpenAI 兼容，已知厂商不动。
+    """
+    import penshot.neopen.client.client_factory as client_factory
+
+    if getattr(client_factory, "_penshot_openai_patch", False):
+        return
+    original = client_factory.detect_ai_provider_by_url
+
+    def detect(base_url, _original=original):
+        detected = _original(base_url)
+        try:
+            from penshot.neopen.client.client_config import ClientType
+
+            url = str(base_url or "").lower()
+            if detected == ClientType.OLLAMA and "11434" not in url and "ollama" not in url:
+                return ClientType.OPENAI
+        except Exception:
+            pass
+        return detected
+
+    client_factory.detect_ai_provider_by_url = detect
+    client_factory._penshot_openai_patch = True
+
+
+def _penshot_disable_checkpointer():
+    """关掉 LangGraph 的检查点，绕开 penshot 的序列化崩溃。
+
+    penshot 编译工作流时总会挂一个 checkpointer（内存或 SQLite 都一样），LangGraph 每走
+    一个超步都会把状态序列化落盘，而 penshot 的 WorkflowState 过不了 msgpack，任务收尾写
+    检查点时必然抛 "Type is not msgpack serializable: WorkflowState"。我们这里是一次性进程内
+    调用、不需要断点续跑，直接把 saver 置空让 compile(checkpointer=None)，从根上不序列化。
+    """
+    import penshot.neopen.agent.workflow.workflow_checkpointer as wc
+
+    if getattr(wc, "_penshot_nocheckpoint_patch", False):
+        return
+
+    def get_saver(self):
+        return None
+
+    wc.WorkflowCheckpointer.get_saver = get_saver
+    wc._penshot_nocheckpoint_patch = True
+
+
+def get_penshot_agent(provider_id, base_url, api_key, model, min_duration, max_duration):
+    """按（平台, 模型, 时长区间）复用 PenshotFunction 单例。
+
+    它构造时会起一个后台事件循环线程并自带任务队列，重复创建既浪费又会让状态查询对不上号。
+    没装 penshot 时抛 503，页面会提示 PenShot 不可用。
+    """
+    _penshot_prepare_import()
+    try:
+        from penshot.api import create_penshot_agent
+        from penshot.config.config_models import LLMBaseConfig
+        from penshot.neopen.shot_config import ShotConfig
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"PenShot 未安装或导入失败：{exc}")
+
+    _penshot_force_openai_compatible()
+    _penshot_disable_checkpointer()
+
+    key = f"{provider_id}|{model}|{min_duration:g}|{max_duration:g}"
+    with _PENSHOT_AGENT_LOCK:
+        agent = _PENSHOT_AGENTS.get(key)
+        if agent is not None:
+            return agent
+        # PenShot 的「镜头」天然是 2~6 秒（分镜提示词把单镜头硬卡在 8 秒内），片段又基本
+        # 1:1 跟随镜头，所以它给不出 10~15 秒的片段。这里让镜头层保持默认宽度、不触发
+        # 「过短镜头」校验循环，10~15 秒的对齐放到后面 _penshot_merge_fragments 里做。
+        config = ShotConfig(
+            llm=LLMBaseConfig(base_url=base_url, api_key=api_key, model_name=model),
+            min_shot_duration=1.0,
+            max_shot_duration=8.0,
+            # 阈值调高：镜头不再被二次拆分，1 个镜头对应 1 个片段，便于按 10~15s 归并
+            duration_split_threshold=60.0,
+            # 无控制台的服务器环境：人工干预点自动决策，别等输入
+            human_intervention_mode="auto",
+            auto_continue_on_human_intervention=True,
+        )
+        agent = create_penshot_agent(config=config, max_concurrent=2)
+        _PENSHOT_AGENTS[key] = agent
+        return agent
+
+
+def _penshot_merge_fragments(fragments, min_duration, max_duration):
+    """把 PenShot 连续的短片段归并成 min~max 秒一段，对齐 MiniMax H3 的单段时长。
+
+    贪心累加：能装下就并入当前段，装不下就起新段；提示词、音频、角色按段拼接/去重。
+    """
+    def _dur(frag):
+        try:
+            return float(frag.get("duration") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    groups = []
+    current = []
+    current_duration = 0.0
+    for frag in fragments:
+        duration = _dur(frag)
+        if current and current_duration + duration > max_duration:
+            groups.append(current)
+            current = []
+            current_duration = 0.0
+        current.append(frag)
+        current_duration += duration
+    if current:
+        groups.append(current)
+
+    merged = []
+    for index, group in enumerate(groups, start=1):
+        prompts = [str(item.get("prompt") or "").strip() for item in group]
+        prompts = [p for p in prompts if p]
+        negatives = [str(item.get("negative_prompt") or "").strip() for item in group]
+        negatives = list(dict.fromkeys([n for n in negatives if n]))
+        audios = []
+        for item in group:
+            audio = item.get("audio") or {}
+            text = str(audio.get("prompt") or "").strip() if isinstance(audio, dict) else str(audio or "").strip()
+            if text:
+                audios.append(text)
+        first = group[0]
+        merged.append({
+            "fragment_id": f"F{index:03d}",
+            "prompt": "\n\n".join(prompts),
+            "negative_prompt": "；".join(negatives),
+            "main_character": first.get("main_character") or "",
+            "duration": round(sum(_dur(item) for item in group), 2),
+            "model": first.get("model") or "",
+            "style": first.get("style") or "",
+            "requires_special_attention": any(bool(item.get("requires_special_attention")) for item in group),
+            "audio": {"prompt": " ".join(audios)} if audios else (first.get("audio") or {}),
+            "source_fragments": [str(item.get("fragment_id") or "") for item in group],
+            "shot_count": len(group),
+        })
+    return merged
+
+
+def _penshot_stage_results(agent, task_id):
+    """读 PenShot 任务内各阶段的完成产出（场景/角色/镜头/片段/审查分数等），用于过程展示。
+
+    get_task_status 只暴露进度与阶段名，不含这些计数；计数存在底层任务的 stage_results 里，
+    这里在轮询时顺带取出来透传给前端。取不到就返回空字典，不影响主流程。
+    """
+    try:
+        manager = getattr(getattr(agent, "task_factory", None), "task_manager", None)
+        task = manager.get_task(task_id) if manager else None
+        results = task.get("stage_results") if isinstance(task, dict) else None
+        return dict(results) if isinstance(results, dict) else {}
+    except Exception:
+        return {}
+
+
+def _penshot_task_dict(agent, task_id):
+    """读 PenShot 的任务记录（含 script_id 等），取不到返回空字典。
+
+    中间产物按 data/output/{script_id}/{task_id}/ 落盘，script_id 只能从任务记录拿 ——
+    未保存的剧本 PenShot 会自生成 SN... 编号，跟前端 payload 传的值未必一致。
+    """
+    try:
+        manager = getattr(getattr(agent, "task_factory", None), "task_manager", None)
+        task = manager.get_task(task_id) if manager else None
+        return dict(task) if isinstance(task, dict) else {}
+    except Exception:
+        return {}
+
+
+def _penshot_load_stage_json(agent, task_id, filename):
+    """从 PenShot 落盘的阶段产物读一份 JSON（剧本解析 / 镜头拆分 / 质量校验）。
+
+    生产模式下 get_task_result 的 result.data 不含 script_analysis / shot_sequence /
+    audit_report（WorkflowOutputFixer 以 is_debug=False 构造，这些键包在 debug 分支里），
+    中间产物只能从阶段文件读。缺文件 / 异常一律返回空字典，不影响片段结果。
+    """
+    try:
+        _penshot_prepare_import()
+        from penshot.neopen.tools.result_storage_tool import create_result_storage
+
+        script_id = str(_penshot_task_dict(agent, task_id).get("script_id") or "")
+        if not script_id:
+            return {}
+        data = create_result_storage().load_result(script_id, task_id, filename)
+        return dict(data) if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _penshot_glue(items, sep):
+    """把非空片段按分隔符连起来；空片段整段跳过，避免拼出「，。」这类噪音。"""
+    return sep.join(str(item).strip() for item in items if str(item or "").strip())
+
+
+def _penshot_cast_prompts(parsed, style_block):
+    """从 script_parser_result.json 拼装人物 / 场景 / 道具提示词。
+
+    PenShot 没有现成的成稿提示词字段，这里把散落的属性拼成能直接出图的规格稿。规格词固定为
+    「三视图提示词 / 概念图 / 道具档案图」，都落在前端 CAST_SPEC_WORDS 白名单里，采用后能正确
+    剥掉规格后缀。style_block 与第 2 步人物 / 场景生成用同一套画风措辞，接在正文之前。
+    """
+    parsed = parsed if isinstance(parsed, dict) else {}
+    style = str(style_block or "").strip()
+    meta = parsed.get("global_metadata") if isinstance(parsed.get("global_metadata"), dict) else {}
+
+    outfits = {}
+    for item in meta.get("character_outfits") or []:
+        if isinstance(item, dict) and str(item.get("character") or "").strip():
+            outfits[str(item["character"]).strip()] = item
+    locations = {}
+    for item in meta.get("key_locations") or []:
+        if isinstance(item, dict) and str(item.get("name") or "").strip():
+            locations[str(item["name"]).strip()] = item
+
+    def pack(body):
+        # 画风段与正文之间空一行；没有画风就只给正文
+        return "\n".join(part for part in [style, body] if part)
+
+    characters = []
+    for item in parsed.get("characters") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        gender = str(item.get("gender") or "").strip()
+        if gender.lower() in {"unknown", "未知"}:
+            gender = ""
+        outfit = outfits.get(name) or {}
+        traits = _penshot_glue([t for t in (item.get("key_traits") or [])], "、")
+        desc = str(item.get("description") or "").strip()
+        intro = _penshot_glue([name, gender, str(item.get("role") or "").strip()], "，")
+        characters.append({
+            "name": name,
+            "spec": "三视图提示词",
+            "prompt": pack("".join([
+                f"{intro}。" if intro else "",
+                desc,
+                f"关键特征：{traits}。" if traits else "",
+                f"服装：{str(outfit.get('description') or '').strip() or '按剧本设定'}。",
+                "角色三视图（正面 / 侧面 / 背面），全身，纯色背景，五官、发型与服装细节清晰，三个视图为同一角色。",
+            ])),
+        })
+
+    scenes = []
+    for item in parsed.get("scenes") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("location") or "").strip()
+        if not name:
+            continue
+        loc = locations.get(name) or {}
+        cues = _penshot_glue([c for c in (loc.get("visual_cues") or [])], "、")
+        intro = _penshot_glue([name, str(item.get("time_of_day") or "").strip(), str(item.get("weather") or "").strip()], "，")
+        scenes.append({
+            "name": name,
+            "spec": "概念图",
+            "prompt": pack("".join([
+                f"{intro}。" if intro else "",
+                str(item.get("description") or "").strip(),
+                f"视觉特征：{cues}。" if cues else "",
+                "场景概念图，横构图，突出空间层次与透视关系，不含人物。",
+            ])),
+        })
+
+    props = []
+    for item in meta.get("key_props") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        color = str(item.get("color") or "").strip()
+        importance = str(item.get("importance") or "").strip()
+        intro = _penshot_glue([name, str(item.get("description") or "").strip()], "，")
+        props.append({
+            "name": name,
+            "spec": "道具档案图",
+            "prompt": pack("".join([
+                f"{intro}。" if intro else "",
+                f"颜色：{color}。" if color else "",
+                f"重要性：{importance}。" if importance else "",
+                "道具档案图，居中陈列，纯色背景，材质与细节清晰可辨。",
+            ])),
+        })
+
+    return {"characters": characters, "scenes": scenes, "props": props}
+
+
+def _penshot_shot_view(shots_json):
+    """把 shot_segmenter_result.json 的 shots[] 收窄成前端「镜头拆分」要画的字段。"""
+    shots = shots_json.get("shots") if isinstance(shots_json, dict) else None
+    view = []
+    for shot in shots or []:
+        if not isinstance(shot, dict):
+            continue
+        view.append({
+            "id": shot.get("id") or "",
+            "scene_id": shot.get("scene_id") or "",
+            "description": shot.get("description") or "",
+            "duration": shot.get("duration"),
+            "shot_type": shot.get("shot_type") or "",
+            "main_character": shot.get("main_character") or "",
+            "emotion": shot.get("emotion") or "",
+        })
+    return view
+
+
+def _penshot_audit_view(audit_json):
+    """把 quality_auditor_result.json 收窄成前端「质量校验」要画的字段。"""
+    audit = audit_json if isinstance(audit_json, dict) else {}
+    stats = audit.get("stats") if isinstance(audit.get("stats"), dict) else {}
+    checks = []
+    for check in audit.get("checks") or []:
+        if not isinstance(check, dict):
+            continue
+        checks.append({
+            "name": check.get("name") or "",
+            "status": check.get("status") or "",
+            "details": check.get("details") or "",
+        })
+    violations = audit.get("violations")
+    return {
+        "status": audit.get("status") or "",
+        "stats": {
+            "pass_rate": stats.get("pass_rate"),
+            "warning": stats.get("warning"),
+            "error": stats.get("error"),
+            "total_checks": stats.get("total_checks"),
+            "passed_checks": stats.get("passed_checks"),
+        },
+        "checks": checks,
+        "violations": len(violations) if isinstance(violations, list) else 0,
+        "suggestions": [str(s) for s in (audit.get("suggestions") or [])][:5],
+    }
+
+
+def _penshot_fragment_ref_map(parsed, segmented, splitter):
+    """建立「片段 → 关联人物 / 场景地点」的映射，供前端「采用」时显式绑定参考图。
+
+    PenShot 的片段提示词是英中双语，未必逐字包含第 2 步人物 / 场景清单里的条目名，
+    前端只按文字包含匹配就会漏掉场景图。这里从阶段产物回推每个片段真正对应的
+    场景地点与出场人物：video_splitter 的片段 → shot_id → shot 的 scene_id / 出场角色，
+    再映射到解析结果里的场景 location 与元素角色。
+
+    关联链：prompt_converter 片段 id == video_splitter 片段 id（frag_xxx）。
+    """
+    parsed = parsed if isinstance(parsed, dict) else {}
+    scenes_by_id = {}
+    elem_character = {}
+    for scene in parsed.get("scenes") or []:
+        if not isinstance(scene, dict):
+            continue
+        scene_id = str(scene.get("id") or "")
+        if scene_id:
+            scenes_by_id[scene_id] = str(scene.get("location") or "").strip()
+        for elem in scene.get("elements") or []:
+            if isinstance(elem, dict) and elem.get("id"):
+                name = str(elem.get("character") or "").strip()
+                if name:
+                    elem_character[str(elem["id"])] = name
+
+    shots_by_id = {}
+    for shot in (segmented.get("shots") if isinstance(segmented, dict) else []) or []:
+        if isinstance(shot, dict) and shot.get("id"):
+            shots_by_id[str(shot["id"])] = shot
+
+    ref_map = {}
+    for frag in (splitter.get("fragments") if isinstance(splitter, dict) else []) or []:
+        if not isinstance(frag, dict) or not frag.get("id"):
+            continue
+        shot = shots_by_id.get(str(frag.get("shot_id") or "")) or {}
+        characters = []
+        main = str(shot.get("main_character") or "").strip()
+        if main:
+            characters.append(main)
+        for elem_id in frag.get("element_ids") or []:
+            name = elem_character.get(str(elem_id))
+            if name and name not in characters:
+                characters.append(name)
+        scene_name = scenes_by_id.get(str(shot.get("scene_id") or ""), "")
+        entry = {
+            "characters": characters,
+            "scenes": [scene_name] if scene_name else [],
+        }
+        ref_map[str(frag["id"])] = entry
+        # 只有「镜头拆分」阶段产出时片段的 id 就是 shot id，也认一份，保证关联信息不断
+        if shot.get("id"):
+            ref_map.setdefault(str(shot["id"]), entry)
+    return ref_map
+
+
+def _penshot_name_in_prompt(name, prompt):
+    """素材名是否真的出现在这版提示词里（去掉空白后做包含匹配，名字本身很短，不会误伤）。"""
+    text = str(name or "").strip()
+    if not text:
+        return False
+    body = str(prompt or "")
+    if not body:
+        return False
+    if text in body:
+        return True
+    return text.replace(" ", "") in body.replace(" ", "")
+
+
+# 旁白 / 解说这类只在提示词里当说话人、画面里并不出现的角色，不该关联三视图
+PENSHOT_NON_VISUAL_REF_RE = re.compile(r"旁白|旁述|解说|叙述|画外音|字幕")
+
+
+def _penshot_is_visual_ref(name) -> bool:
+    return not PENSHOT_NON_VISUAL_REF_RE.search(str(name or ""))
+
+
+def _penshot_with_refs(fragments, ref_map):
+    """把片段合并后，按 source_fragments 并集出该片段对应的人物 / 场景名，再**只留提示词里真正用到的**。
+
+    关联素材之前是把源镜头的全部人物 / 场景都挂上，一个 10~15 秒的片段常常挂到四五个人
+    （连旁白、群众都算），参考图就绑得太多。这里拿片段的最终提示词反过来筛：名字没出现在
+    提示词里的直接丢掉——提示词用到才关联素材图。
+
+    提示词是英中双语的，英文版（如 Xiaoming / Qin Jin）匹配不到中文名，这时退化为
+    「该片段开场的那个主角 + 开场所在的场景」，保证不会一个关联都不剩。
+    """
+    for frag in fragments:
+        if not isinstance(frag, dict):
+            continue
+        characters, scenes = [], []
+        for fid in frag.get("source_fragments") or []:
+            ref = ref_map.get(str(fid)) or {}
+            for name in ref.get("characters") or []:
+                if name and name not in characters:
+                    characters.append(name)
+            for name in ref.get("scenes") or []:
+                if name and name not in scenes:
+                    scenes.append(name)
+        prompt = str(frag.get("prompt") or "")
+        used_characters = [
+            name for name in characters
+            if _penshot_is_visual_ref(name) and _penshot_name_in_prompt(name, prompt)
+        ]
+        used_scenes = [name for name in scenes if _penshot_name_in_prompt(name, prompt)]
+        # 一个都没匹配上（多半是英文提示词）：至少保留开场那个画面里会出现的主角 / 开场场景
+        if not used_characters and characters:
+            visual = [name for name in characters if _penshot_is_visual_ref(name)]
+            used_characters = (visual or characters)[:1]
+        if not used_scenes and scenes:
+            used_scenes = scenes[:1]
+        frag["characters"] = used_characters
+        frag["scenes"] = used_scenes
+        # 被筛掉的名额留个底，方便排查「为什么这张图没关联上」
+        frag["dropped_refs"] = {
+            "characters": [name for name in characters if name not in used_characters],
+            "scenes": [name for name in scenes if name not in used_scenes],
+        }
+    return fragments
+
+
+def _penshot_shots_as_fragments(segmented):
+    """只有镜头拆分结果时，把镜头当片段用（提示词退化成镜头描述），保证「到点先取已产出的」有东西可用。"""
+    shots = segmented.get("shots") if isinstance(segmented, dict) else None
+    frags = []
+    for shot in shots or []:
+        if not isinstance(shot, dict) or not shot.get("id"):
+            continue
+        frags.append({
+            "fragment_id": str(shot["id"]),
+            "prompt": str(shot.get("description") or "").strip(),
+            "negative_prompt": "",
+            "main_character": shot.get("main_character") or "",
+            "duration": shot.get("duration"),
+            "requires_special_attention": False,
+            "audio": {},
+        })
+    return frags
+
+
+def _penshot_splitter_as_fragments(splitter):
+    """只有视频分段结果时，用分段的镜头描述当提示词。"""
+    frags = []
+    for item in (splitter.get("fragments") if isinstance(splitter, dict) else []) or []:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        frags.append({
+            "fragment_id": str(item["id"]),
+            "prompt": str(item.get("description") or "").strip(),
+            "negative_prompt": "",
+            "main_character": "",
+            "duration": item.get("duration"),
+            "requires_special_attention": bool(item.get("requires_special_attention")),
+            "audio": {},
+        })
+    return frags
+
+
+def _penshot_available_fragments(agent, task_id, min_duration, max_duration):
+    """取「当前已经产出」的片段，供长剧本跑到一半先并入分镜用。
+
+    PenShot 的阶段产物是整批落盘的：优先用「转换提示词」的结果（真正的视频提示词），
+    还没跑到就用「视频分段」的镜头描述，再不行用「拆分镜头」的镜头描述。取不到就回空。
+    """
+    parsed = _penshot_load_stage_json(agent, task_id, "script_parser_result.json")
+    segmented = _penshot_load_stage_json(agent, task_id, "shot_segmenter_result.json")
+    splitter = _penshot_load_stage_json(agent, task_id, "video_splitter_result.json")
+    converter = _penshot_load_stage_json(agent, task_id, "prompt_converter_result.json")
+
+    raw = converter.get("fragments") if isinstance(converter, dict) else None
+    source = "prompt"
+    if not raw:
+        raw = _penshot_splitter_as_fragments(splitter)
+        source = "split"
+    if not raw:
+        raw = _penshot_shots_as_fragments(segmented)
+        source = "shots"
+    if not raw:
+        return {"fragments": [], "parsed": parsed, "segmented": segmented, "splitter": splitter, "source": "none"}
+
+    ref_map = _penshot_fragment_ref_map(parsed, segmented, splitter)
+    fragments = _penshot_with_refs(_penshot_merge_fragments(raw, min_duration, max_duration), ref_map)
+    return {"fragments": fragments, "parsed": parsed, "segmented": segmented, "splitter": splitter, "source": source}
+
+
+def _fragments_total_duration(fragments):
+    """片段的累计时长（秒）。"""
+    total = 0.0
+    for frag in fragments or []:
+        try:
+            total += float(frag.get("duration") or 0)
+        except (TypeError, ValueError):
+            pass
+    return round(total, 2)
+
+
+def _penshot_trim_to_duration(fragments, limit):
+    """按累计时长截断：一段段往后累加，累计到上限就停（保留跨过上限的那一段，不丢内容）。"""
+    if not limit or limit <= 0:
+        return fragments
+    out = []
+    total = 0.0
+    for frag in fragments or []:
+        out.append(frag)
+        try:
+            total += float(frag.get("duration") or 0)
+        except (TypeError, ValueError):
+            pass
+        if total >= limit:
+            break
+    return out
+
+
+@app.get("/api/script/penshot/refs")
+async def penshot_fragment_refs(script_id: str = "", task_id: str = ""):
+    """按剧本 id + 任务号回推每个片段关联的场景地点 / 出场人物。
+
+    给「旧存档」补齐参考图绑定用：这些片段是本次功能上线前跑出来的，没带 characters / scenes，
+    但阶段产物还留在 data/output/{script_id}/{task_id}/ 下，直接读文件就能回推，
+    不依赖内存里的任务记录（服务重启后任务记录会丢）。返回 {fragments: {frag_xxx: {...}}}。
+    """
+    sid = str(script_id or "").strip()
+    tid = str(task_id or "").strip()
+    if not sid or not tid:
+        raise HTTPException(status_code=400, detail="缺少 script_id 或 task_id。")
+    try:
+        _penshot_prepare_import()
+        from penshot.neopen.tools.result_storage_tool import create_result_storage
+
+        storage = create_result_storage()
+
+        def load(name):
+            try:
+                data = storage.load_result(sid, tid, name)
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+
+        parsed = load("script_parser_result.json")
+        segmented = load("shot_segmenter_result.json")
+        splitter = load("video_splitter_result.json")
+        return {"fragments": _penshot_fragment_ref_map(parsed, segmented, splitter)}
+    except Exception:
+        return {"fragments": {}}
+
+
+@app.post("/api/script/penshot/breakdown")
+async def penshot_breakdown(payload: ScriptPenshotRequest):
+    """把整部剧本交给 PenShot 管线，产出 10–15 秒一段的 AI 视频提示词。
+
+    进度按 PenShot 内部真实阶段透传（解析 / 拆分镜头 / 视频分段 / 转换提示词 / 质量审查 /
+    连续性检查 / 生成输出），并附带各已完成阶段的产出计数；结束后一次性回传片段表。
+    结果只写第 5 步卡片，不碰人物/场景与已生成的分镜提示词。
+    """
+    script = str(payload.script or "").strip()
+    if not script:
+        raise HTTPException(status_code=400, detail="请先上传或粘贴剧本。")
+
+    chat_base, chat_headers, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
+    api_provider = get_api_provider(payload.provider or "")
+    if effective_protocol(api_provider, model) in PENSHOT_UNSUPPORTED_PROTOCOLS:
+        raise HTTPException(
+            status_code=400,
+            detail="该平台的接口协议不是 OpenAI 兼容，PenShot 暂不支持；请改用 OpenAI 兼容的平台（如 comfly / ModelScope）。",
+        )
+
+    auth = str(chat_headers.get("Authorization") or "")
+    api_key = auth[7:].strip() if auth.lower().startswith("bearer ") else str(chat_headers.get("x-goog-api-key") or "")
+
+    min_duration = max(1.0, float(payload.min_duration or 10.0))
+    max_duration = max(min_duration + 0.5, float(payload.max_duration or 15.0))
+    # 提取时长上限：按「已提取分镜的累计时长」停止，0 = 不限（提取全部）
+    duration_limit = max(0.0, float(payload.duration_limit or 0.0))
+    provider_id = str(api_provider.get("id") or payload.provider or "")
+
+    agent = get_penshot_agent(provider_id, chat_base, api_key, model, min_duration, max_duration)
+    script_id = str(payload.script_id or "").strip() or None
+    # 画风：应用的画风映射到 PenShot 的 6 种视频风格并传给它，让视频分镜提示词跟着画风走
+    # （人物/场景/道具提示词本来就用 payload.style_id 生成，这里把视频分镜这一路也接上）
+    # 注意：必须放在 get_penshot_agent 之后——本机没有 Redis 时，penshot 要靠它装的替身才能导入，
+    # 提前 import penshot 会先踩到 Redis 缺失的导入错误，之后连 agent 都建不起来（返回 503）。
+    video_style_value = script_video_style(payload.style_id)
+    video_style = None
+    if video_style_value:
+        try:
+            from penshot.neopen.agent.base_models import VideoStyle
+            video_style = VideoStyle(video_style_value)
+        except Exception:
+            video_style = None
+
+    async def stream():
+        yield sse_event({
+            "type": "meta",
+            "model": model,
+            "provider": api_provider.get("name") or api_provider.get("id"),
+        })
+        try:
+            # breakdown_script_async 是普通函数：投递任务后立刻返回 task_id；画风随任务一起交给 PenShot
+            task_id = await asyncio.to_thread(agent.breakdown_script_async, script, script_id, video_style)
+        except Exception as exc:
+            log_net_error("PenShot 任务投递", exc)
+            yield sse_event({"type": "penshot_error", "detail": f"任务投递失败：{type(exc).__name__}: {exc}"})
+            yield sse_event({"type": "done"})
+            return
+
+        yield sse_event({"type": "penshot_start", "task_id": task_id})
+
+        settled = False
+        state = "unknown"
+        last_progress = None
+        last_stage = None
+        last_partial_sig = ""
+        started_at = time.monotonic()
+        deadline = started_at + PENSHOT_MAX_WAIT
+
+        def cancel_quietly():
+            # 用户中途点「停止」或连接断开：把还在跑的任务取消掉
+            if not settled:
+                try:
+                    agent.cancel_task(task_id)
+                except Exception:
+                    pass
+
+        try:
+            while True:
+                status = await asyncio.to_thread(agent.get_task_status, task_id) or {}
+                # TaskStatus 是 (str, Enum)：直接 str() 会得到 "TaskStatus.SUCCESS"，取 .value 才是 "success"
+                raw_state = status.get("status")
+                state = str(getattr(raw_state, "value", raw_state) or "").lower()
+                progress = float(status.get("progress") or 0)
+                current_stage = status.get("stage") or ""
+                # 每一步都透传实时状态（不再只在变化时发）：长耗时阶段也能看到当前阶段名、
+                # 上游各阶段自己的进度 / 状态 / 起止时间（stages_progress），以及已完成阶段的产出计数。
+                yield sse_event({
+                    "type": "penshot_stage",
+                    "progress": progress,
+                    "stage": current_stage,
+                    "stage_name": status.get("stage_name") or "",
+                    "stages_progress": status.get("stages_progress") or {},
+                    "stage_results": _penshot_stage_results(agent, task_id),
+                    "elapsed": round(time.monotonic() - started_at, 1),
+                })
+                if progress != last_progress or current_stage != last_stage:
+                    last_progress = progress
+                    last_stage = current_stage
+                    # 阶段产物一批批落盘：只要已产出的片段变了，就先透传给前端并入分镜（不必等跑完）
+                    partial = await asyncio.to_thread(
+                        _penshot_available_fragments, agent, task_id, min_duration, max_duration
+                    )
+                    frags = partial.get("fragments") or []
+                    sig = f"{partial.get('source')}:{len(frags)}:{frags[-1].get('fragment_id') if frags else ''}"
+                    if frags and sig != last_partial_sig:
+                        last_partial_sig = sig
+                        yield sse_event({
+                            "type": "penshot_partial",
+                            "fragments": frags,
+                            "source": partial.get("source") or "",
+                            "partial": True,
+                        })
+                    # 提取时长到上限即收尾：只认「真正的视频提示词」这段产出，
+                    # 累计到用户设的时长就取前若干段结束，不再等后面的审查 / 连续性 / 输出。
+                    if (duration_limit > 0 and partial.get("source") == "prompt"
+                            and _fragments_total_duration(frags) >= duration_limit):
+                        settled = True
+                        state = "capped"
+                        try:
+                            agent.cancel_task(task_id)
+                        except Exception:
+                            pass
+                        break
+                if state in PENSHOT_TERMINAL_STATES:
+                    settled = True
+                    break
+                if time.monotonic() > deadline:
+                    settled = True
+                    state = "timeout"
+                    break
+                await asyncio.sleep(1.0)
+
+            if state == "capped":
+                # 提取时长到上限：取前若干段（累计到上限为止）收尾，附上来源与已提取时长
+                partial = await asyncio.to_thread(
+                    _penshot_available_fragments, agent, task_id, min_duration, max_duration
+                )
+                frags = _penshot_trim_to_duration(partial.get("fragments") or [], duration_limit)
+                metadata = {
+                    "partial": True,
+                    "partial_source": partial.get("source") or "",
+                    "merged_fragment_count": len(frags),
+                    "extracted_duration": _fragments_total_duration(frags),
+                    "duration_limit": duration_limit,
+                    "target_duration": [min_duration, max_duration],
+                }
+                parsed_p = partial.get("parsed") or {}
+                yield sse_event({
+                    "type": "penshot_done",
+                    "fragments": frags,
+                    "metadata": metadata,
+                    "validation": {},
+                    "partial": True,
+                    "cast_prompts": _penshot_cast_prompts(parsed_p, script_style_block(find_script_style(payload.style_id))),
+                    "shots": _penshot_shot_view(partial.get("segmented") or {}),
+                    "audit": {},
+                    "generated_at": "",
+                })
+                yield sse_event({"type": "done"})
+                return
+
+            if state != "success":
+                detail = {
+                    "timeout": f"PenShot 超过 {int(PENSHOT_MAX_WAIT)} 秒仍未完成，已放弃等待。",
+                    "cancelled": "任务已取消。",
+                    "not_found": "任务不存在或已过期。",
+                    "failed": "PenShot 管线执行失败。",
+                }.get(state, f"PenShot 任务状态异常：{state}")
+                status = await asyncio.to_thread(agent.get_task_status, task_id) or {}
+                if status.get("error"):
+                    detail = f"{detail}（{status['error']}）"
+                yield sse_event({"type": "penshot_error", "detail": detail})
+                yield sse_event({"type": "done"})
+                return
+
+            result = await asyncio.to_thread(agent.get_task_result, task_id)
+            data = (result.data if result else None) or {}
+            instructions = data.get("instructions") or {}
+            raw_fragments = instructions.get("fragments") or []
+            fragments = _penshot_merge_fragments(raw_fragments, min_duration, max_duration)
+            metadata = dict(instructions.get("metadata") or {})
+            metadata["raw_fragment_count"] = len(raw_fragments)
+            metadata["merged_fragment_count"] = len(fragments)
+            metadata["target_duration"] = [min_duration, max_duration]
+            # 中间产物：生产模式下 result.data 不带解析 / 镜头 / 校验报告，改从阶段落盘文件读
+            parsed = _penshot_load_stage_json(agent, task_id, "script_parser_result.json")
+            segmented = _penshot_load_stage_json(agent, task_id, "shot_segmenter_result.json")
+            audit_raw = _penshot_load_stage_json(agent, task_id, "quality_auditor_result.json")
+            splitter = _penshot_load_stage_json(agent, task_id, "video_splitter_result.json")
+            # 给每个片段附上它真正对应的场景地点 / 出场人物，前端「采用」时据此绑定参考图
+            ref_map = _penshot_fragment_ref_map(parsed, segmented, splitter)
+            fragments = _penshot_with_refs(fragments, ref_map)
+            yield sse_event({
+                "type": "penshot_done",
+                "fragments": fragments,
+                "metadata": metadata,
+                "validation": data.get("audit_report") or {},
+                # 本次新增：供第 5 步只读展示 + 手动「采用」，不覆盖任何已有内容
+                "cast_prompts": _penshot_cast_prompts(parsed, script_style_block(find_script_style(payload.style_id))),
+                "shots": _penshot_shot_view(segmented),
+                "audit": _penshot_audit_view(audit_raw),
+                "generated_at": str((instructions.get("metadata") or {}).get("generated_at") or ""),
+            })
+        finally:
+            if not settled:
+                cancel_quietly()
         yield sse_event({"type": "done"})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
@@ -18191,7 +20367,9 @@ async def generate_script_prompts(payload: ScriptGenerateRequest, request: Reque
     chat_base, chat_headers, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
     api_provider = get_api_provider(payload.provider or "")
     characters = str(payload.characters or "").strip()
-    system_prompt = build_script_system_prompt(template, payload.allow_rewrite, payload.notes, characters)
+    system_prompt = build_script_system_prompt(
+        template, payload.allow_rewrite, payload.notes, characters, find_script_style(payload.style_id)
+    )
 
     async def stream():
         yield sse_event({
@@ -18206,67 +20384,84 @@ async def generate_script_prompts(payload: ScriptGenerateRequest, request: Reque
         ]
         content_parts = []
         finish_reason = ""
+        raw_usage = None
+        req_body = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "max_tokens": SCRIPT_GENERATE_MAX_TOKENS,
+        }
+        with_usage = apply_stream_usage_option(req_body, payload.provider, api_provider, model)
         async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
-            try:
-                # 逐 token 转发上游输出：前端边收边渲染，不用等整段写完才看到结果
-                async with client.stream(
-                    "POST",
-                    f"{chat_base}/chat/completions",
-                    headers=chat_headers,
-                    json={
-                        "model": model,
-                        "messages": messages,
-                        "stream": True,
-                        "max_tokens": SCRIPT_GENERATE_MAX_TOKENS,
-                    },
-                ) as response:
-                    if response.status_code >= 400:
-                        body = (await response.aread()).decode("utf-8", errors="ignore")
-                        friendly = friendly_chat_error_detail(body, model, api_provider)
-                        yield sse_event({
-                            "type": "episode_error",
-                            "index": 0,
-                            "detail": friendly or f"上游接口错误：{body[:500]}",
-                        })
-                        yield sse_event({"type": "done"})
-                        return
-                    async for line in response.aiter_lines():
-                        # 前端点「停止」会断开连接，这里立刻收手，别再等上游把剩下的吐完
-                        if await request.is_disconnected():
+            # 上游不认 stream_options 时要能回退重试，所以这里用循环而非单次请求
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    # 逐 token 转发上游输出：前端边收边渲染，不用等整段写完才看到结果
+                    async with client.stream(
+                        "POST",
+                        f"{chat_base}/chat/completions",
+                        headers=chat_headers,
+                        json=req_body,
+                    ) as response:
+                        if response.status_code >= 400:
+                            body = (await response.aread()).decode("utf-8", errors="ignore")
+                            if attempt == 1 and with_usage and stream_options_rejected(response.status_code, body):
+                                _STREAM_USAGE_UNSUPPORTED.add(str(payload.provider or "").strip().lower())
+                                req_body.pop("stream_options", None)
+                                with_usage = False
+                                continue
+                            friendly = friendly_chat_error_detail(body, model, api_provider)
+                            yield sse_event({
+                                "type": "episode_error",
+                                "index": 0,
+                                "detail": friendly or f"上游接口错误：{body[:500]}",
+                            })
+                            yield sse_event({"type": "done"})
                             return
-                        if not line:
-                            continue
-                        if line.startswith("data:"):
-                            line = line[5:].strip()
-                        if line == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if not isinstance(chunk, dict):
-                            continue
-                        choice = (chunk.get("choices") or [{}])[0] or {}
-                        if choice.get("finish_reason"):
-                            finish_reason = choice.get("finish_reason")
-                        piece = text_delta_from_chat_chunk(chunk)
-                        if not piece:
-                            # 少数中转服务会忽略 stream 参数，直接把整段结果当一条 JSON 回
-                            message = choice.get("message") or {}
-                            if isinstance(message.get("content"), str):
-                                piece = message.get("content")
-                        if piece:
-                            content_parts.append(piece)
-                            yield sse_event({"type": "delta", "index": 0, "text": piece})
-            except httpx.HTTPError as exc:
-                log_net_error("剧本分镜 生成", exc)
-                yield sse_event({
-                    "type": "episode_error",
-                    "index": 0,
-                    "detail": f"网络错误：{type(exc).__name__}: {exc}",
-                })
-                yield sse_event({"type": "done"})
-                return
+                        async for line in response.aiter_lines():
+                            # 前端点「停止」会断开连接，这里立刻收手，别再等上游把剩下的吐完
+                            if await request.is_disconnected():
+                                return
+                            if not line:
+                                continue
+                            if line.startswith("data:"):
+                                line = line[5:].strip()
+                            if line == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if not isinstance(chunk, dict):
+                                continue
+                            if chunk.get("usage"):
+                                raw_usage = chunk.get("usage")
+                            choice = (chunk.get("choices") or [{}])[0] or {}
+                            if choice.get("finish_reason"):
+                                finish_reason = choice.get("finish_reason")
+                            piece = text_delta_from_chat_chunk(chunk)
+                            if not piece:
+                                # 少数中转服务会忽略 stream 参数，直接把整段结果当一条 JSON 回
+                                message = choice.get("message") or {}
+                                if isinstance(message.get("content"), str):
+                                    piece = message.get("content")
+                            if piece:
+                                content_parts.append(piece)
+                                yield sse_event({"type": "delta", "index": 0, "text": piece})
+                    break
+                except httpx.HTTPError as exc:
+                    log_net_error("剧本分镜 生成", exc)
+                    yield sse_event({
+                        "type": "episode_error",
+                        "index": 0,
+                        "detail": f"网络错误：{type(exc).__name__}: {exc}",
+                    })
+                    yield sse_event({"type": "done"})
+                    return
+        record_llm_usage(payload.provider, model, "script_generate", usage=raw_usage,
+                         prompt_text=script, completion_text="".join(content_parts))
         content = "".join(content_parts)
         if not str(content or "").strip():
             # 推理模型（如 deepseek-flash）会把输出额度先花在思维链上，被截断时正文为空
@@ -18315,7 +20510,7 @@ async def chat_script_storyboard(payload: ScriptChatRequest, request: Request):
     chat_base, chat_headers, model = resolve_chat_provider(payload.provider, payload.model, payload.ms_model)
     api_provider = get_api_provider(payload.provider or "")
     characters = str(payload.characters or "").strip()
-    system_prompt = build_script_chat_system_prompt(template, characters)
+    system_prompt = build_script_chat_system_prompt(template, characters, find_script_style(payload.style_id))
     user_prompt = build_script_chat_user_prompt(payload.script, payload.units, instruction)
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -18335,62 +20530,79 @@ async def chat_script_storyboard(payload: ScriptChatRequest, request: Request):
         })
         content_parts = []
         finish_reason = ""
+        raw_usage = None
+        req_body = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "max_tokens": SCRIPT_GENERATE_MAX_TOKENS,
+        }
+        with_usage = apply_stream_usage_option(req_body, payload.provider, api_provider, model)
         async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
-            try:
-                async with client.stream(
-                    "POST",
-                    f"{chat_base}/chat/completions",
-                    headers=chat_headers,
-                    json={
-                        "model": model,
-                        "messages": messages,
-                        "stream": True,
-                        "max_tokens": SCRIPT_GENERATE_MAX_TOKENS,
-                    },
-                ) as response:
-                    if response.status_code >= 400:
-                        body = (await response.aread()).decode("utf-8", errors="ignore")
-                        friendly = friendly_chat_error_detail(body, model, api_provider)
-                        yield sse_event({
-                            "type": "chat_error",
-                            "detail": friendly or f"上游接口错误：{body[:500]}",
-                        })
-                        yield sse_event({"type": "done"})
-                        return
-                    async for line in response.aiter_lines():
-                        if await request.is_disconnected():
+            # 上游不认 stream_options 时要能回退重试，所以这里用循环而非单次请求
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    async with client.stream(
+                        "POST",
+                        f"{chat_base}/chat/completions",
+                        headers=chat_headers,
+                        json=req_body,
+                    ) as response:
+                        if response.status_code >= 400:
+                            body = (await response.aread()).decode("utf-8", errors="ignore")
+                            if attempt == 1 and with_usage and stream_options_rejected(response.status_code, body):
+                                _STREAM_USAGE_UNSUPPORTED.add(str(payload.provider or "").strip().lower())
+                                req_body.pop("stream_options", None)
+                                with_usage = False
+                                continue
+                            friendly = friendly_chat_error_detail(body, model, api_provider)
+                            yield sse_event({
+                                "type": "chat_error",
+                                "detail": friendly or f"上游接口错误：{body[:500]}",
+                            })
+                            yield sse_event({"type": "done"})
                             return
-                        if not line:
-                            continue
-                        if line.startswith("data:"):
-                            line = line[5:].strip()
-                        if line == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if not isinstance(chunk, dict):
-                            continue
-                        choice = (chunk.get("choices") or [{}])[0] or {}
-                        if choice.get("finish_reason"):
-                            finish_reason = choice.get("finish_reason")
-                        piece = text_delta_from_chat_chunk(chunk)
-                        if not piece:
-                            message = choice.get("message") or {}
-                            if isinstance(message.get("content"), str):
-                                piece = message.get("content")
-                        if piece:
-                            content_parts.append(piece)
-                            yield sse_event({"type": "delta", "text": piece})
-            except httpx.HTTPError as exc:
-                log_net_error("剧本分镜 对话补分镜", exc)
-                yield sse_event({
-                    "type": "chat_error",
-                    "detail": f"网络错误：{type(exc).__name__}: {exc}",
-                })
-                yield sse_event({"type": "done"})
-                return
+                        async for line in response.aiter_lines():
+                            if await request.is_disconnected():
+                                return
+                            if not line:
+                                continue
+                            if line.startswith("data:"):
+                                line = line[5:].strip()
+                            if line == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if not isinstance(chunk, dict):
+                                continue
+                            if chunk.get("usage"):
+                                raw_usage = chunk.get("usage")
+                            choice = (chunk.get("choices") or [{}])[0] or {}
+                            if choice.get("finish_reason"):
+                                finish_reason = choice.get("finish_reason")
+                            piece = text_delta_from_chat_chunk(chunk)
+                            if not piece:
+                                message = choice.get("message") or {}
+                                if isinstance(message.get("content"), str):
+                                    piece = message.get("content")
+                            if piece:
+                                content_parts.append(piece)
+                                yield sse_event({"type": "delta", "text": piece})
+                    break
+                except httpx.HTTPError as exc:
+                    log_net_error("剧本分镜 对话补分镜", exc)
+                    yield sse_event({
+                        "type": "chat_error",
+                        "detail": f"网络错误：{type(exc).__name__}: {exc}",
+                    })
+                    yield sse_event({"type": "done"})
+                    return
+        record_llm_usage(payload.provider, model, "script_storyboard", usage=raw_usage,
+                         prompt_text=instruction, completion_text="".join(content_parts))
         content = "".join(content_parts)
         if not str(content or "").strip():
             detail = "模型没有返回内容，请重试或更换模型。"
@@ -18604,8 +20816,11 @@ def write_script_project(item, payload):
     combined = [part.strip() for part in (item["cast_characters"], item["cast_scenes"], item["cast_props"]) if part.strip()]
     item["cast"] = str(payload.cast or "") or "\n\n".join(combined)
     item["cast_state"] = payload.cast_state if isinstance(payload.cast_state, dict) else {}
+    item["style_id"] = str(payload.style_id or "")
     item["results"] = [row for row in payload.results if isinstance(row, dict)]
     item["session"] = payload.session if isinstance(payload.session, dict) else None
+    item["penshot"] = payload.penshot if isinstance(payload.penshot, dict) else {}
+    item["shot_skill"] = payload.shot_skill if isinstance(payload.shot_skill, dict) else {}
     item["updated_at"] = now_ms()
     return item
 
@@ -18761,8 +20976,11 @@ async def get_script_project(project_id: str):
         "cast_scenes": item.get("cast_scenes") or "",
         "cast_props": item.get("cast_props") or "",
         "cast_state": item.get("cast_state") or {},
+        "style_id": item.get("style_id") or "",
         "results": item.get("results") or [],
         "session": item.get("session"),
+        "penshot": item.get("penshot") or {},
+        "shot_skill": item.get("shot_skill") or {},
     }
 
 
@@ -19229,7 +21447,7 @@ async def import_shared_folder_files(payload: SharedFolderImport):
     save_asset_library(lib)
     return {"library": lib, "items": added}
 
-async def caption_image_with_provider(abs_path, prompt, provider_id, model, ms_model=""):
+async def caption_image_with_provider(abs_path, prompt, provider_id, model, ms_model="", feature="asset_caption"):
     llm_provider = get_api_provider(provider_id) if provider_id not in ("modelscope",) else {}
     if is_codex_provider(llm_provider):
         resolved_model = selected_model(model, (llm_provider.get("chat_models") or CODEX_DEFAULT_CHAT_MODELS)[0])
@@ -19287,6 +21505,7 @@ async def caption_image_with_provider(abs_path, prompt, provider_id, model, ms_m
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"解析上游响应失败：{exc}") from exc
     text = text_from_chat_response(raw).strip() if isinstance(raw, dict) else ""
+    record_llm_usage(provider_id, resolved_model, feature, usage=raw, prompt_text=prompt_text)
     return text or "接口返回了空回复。", resolved_model
 
 @app.patch("/api/asset-library/items/{item_id}")
@@ -19737,6 +21956,9 @@ async def chat(payload: ChatRequest, request: Request, x_user_id: str = Header(d
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"请求上游接口失败：{exc}") from exc
         raw_data = unwrap_apimart_response(raw) if isinstance(raw, dict) else raw
+        record_llm_usage(payload.provider, model, "chat_text", usage=raw,
+                         conversation_id=conversation.get("id") or "",
+                         prompt_text=payload.message, completion_text=text_from_chat_response(raw))
         assistant_message = {
             "id": uuid.uuid4().hex,
             "role": "assistant",
@@ -19943,42 +22165,57 @@ async def chat_stream(payload: ChatRequest, request: Request, x_user_id: str = H
         content_parts = []
         raw_usage = None
         yield sse_event({"type": "meta", "conversation": conversation})
+        req_body = {"model": model, "messages": upstream_messages, "stream": True}
+        with_usage = apply_stream_usage_option(req_body, payload.provider, _stream_provider, model)
         try:
             async with httpx.AsyncClient(timeout=AI_REQUEST_TIMEOUT) as client:
-                async with client.stream(
-                    "POST",
-                    f"{chat_base}/chat/completions",
-                    headers=chat_hdrs,
-                    json={"model": model, "messages": upstream_messages, "stream": True},
-                ) as response:
-                    if response.status_code >= 400:
-                        detail = await response.aread()
-                        body = detail.decode("utf-8", errors="ignore")
-                        friendly = friendly_chat_error_detail(body, model, _stream_provider)
-                        yield sse_event({"type": "error", "detail": friendly or f"上游接口错误：{body}"})
-                        return
-                    async for line in response.aiter_lines():
-                        if not line:
-                            continue
-                        if line.startswith("data:"):
-                            line = line[5:].strip()
-                        if line == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if isinstance(chunk, dict) and chunk.get("usage"):
-                            raw_usage = chunk.get("usage")
-                        delta = text_delta_from_chat_chunk(chunk)
-                        if delta:
-                            content_parts.append(delta)
-                            yield sse_event({"type": "delta", "delta": delta})
+                # 上游不认 stream_options 时要能回退重试，所以这里用循环而非单次请求
+                attempt = 0
+                while True:
+                    attempt += 1
+                    async with client.stream(
+                        "POST",
+                        f"{chat_base}/chat/completions",
+                        headers=chat_hdrs,
+                        json=req_body,
+                    ) as response:
+                        if response.status_code >= 400:
+                            detail = await response.aread()
+                            body = detail.decode("utf-8", errors="ignore")
+                            if attempt == 1 and with_usage and stream_options_rejected(response.status_code, body):
+                                _STREAM_USAGE_UNSUPPORTED.add(str(payload.provider or "").strip().lower())
+                                req_body.pop("stream_options", None)
+                                with_usage = False
+                                continue
+                            friendly = friendly_chat_error_detail(body, model, _stream_provider)
+                            yield sse_event({"type": "error", "detail": friendly or f"上游接口错误：{body}"})
+                            return
+                        async for line in response.aiter_lines():
+                            if not line:
+                                continue
+                            if line.startswith("data:"):
+                                line = line[5:].strip()
+                            if line == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if isinstance(chunk, dict) and chunk.get("usage"):
+                                raw_usage = chunk.get("usage")
+                            delta = text_delta_from_chat_chunk(chunk)
+                            if delta:
+                                content_parts.append(delta)
+                                yield sse_event({"type": "delta", "delta": delta})
+                    break
         except httpx.HTTPError as exc:
             log_net_error("对话(流式) 网络/TLS错误", exc)
             yield sse_event({"type": "error", "detail": f"请求上游接口失败：{exc}"})
             return
 
+        record_llm_usage(payload.provider, model, "chat_stream", usage=raw_usage,
+                         conversation_id=conversation.get("id") or "",
+                         prompt_text=payload.message, completion_text="".join(content_parts))
         assistant_message = {
             "id": uuid.uuid4().hex,
             "role": "assistant",
@@ -19993,6 +22230,144 @@ async def chat_stream(payload: ChatRequest, request: Request, x_user_id: str = H
         yield sse_event({"type": "done", "conversation": conversation, "message": assistant_message})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+# --- LLM 用量统计 ---
+# 全部为新增接口，不改动既有路由的行为与数据结构。
+
+def _usage_range(start, end):
+    return {"start": str(start or ""), "end": str(end or "")}
+
+@app.get("/api/usage/summary")
+def usage_summary(start: str = "", end: str = ""):
+    """总用量与总费用（费用按当前单价表折算，改单价后数字会变）。"""
+    data = summarize_usage(start, end)
+    return {"range": _usage_range(start, end), "currency": data["currency"], "totals": data["totals"]}
+
+@app.get("/api/usage/daily")
+def usage_daily(start: str = "", end: str = ""):
+    """按天汇总，供趋势图使用。"""
+    data = summarize_usage(start, end)
+    days = [{"date": day, **bucket} for day, bucket in sorted(data["days"].items()) if day]
+    return {"range": _usage_range(start, end), "currency": data["currency"], "days": days}
+
+@app.get("/api/usage/by-model")
+def usage_by_model(start: str = "", end: str = ""):
+    """按模型汇总，供柱状图使用。"""
+    data = summarize_usage(start, end)
+    items = []
+    for model, bucket in data["models"].items():
+        items.append({**bucket, "model": model, "priced": bucket["unpriced_tokens"] == 0})
+    items.sort(key=lambda item: item["total_tokens"], reverse=True)
+    return {"range": _usage_range(start, end), "currency": data["currency"], "items": items}
+
+@app.get("/api/usage/by-feature")
+def usage_by_feature(start: str = "", end: str = ""):
+    """按用途（对话 / 剧本 / 素材等）汇总，供柱状图使用。"""
+    data = summarize_usage(start, end)
+    items = []
+    for feature, bucket in data["features"].items():
+        items.append({**bucket, "feature": feature, "priced": bucket["unpriced_tokens"] == 0})
+    items.sort(key=lambda item: item["total_tokens"], reverse=True)
+    return {"range": _usage_range(start, end), "currency": data["currency"], "items": items}
+
+@app.get("/api/usage/records")
+def usage_records(start: str = "", end: str = "", limit: int = 50, offset: int = 0):
+    """调用明细分页，新的在前。"""
+    limit = max(1, min(int(limit or 50), 500))
+    offset = max(0, int(offset or 0))
+    pricing = load_model_pricing()
+    report_currency = str(pricing.get("currency") or "CNY")
+    all_records = list(iter_usage_records(start, end, newest_first=True))
+    items = []
+    for rec in all_records[offset:offset + limit]:
+        prompt_tokens = int(rec.get("prompt_tokens") or 0)
+        completion_tokens = int(rec.get("completion_tokens") or 0)
+        total_tokens = int(rec.get("total_tokens") or 0) or (prompt_tokens + completion_tokens)
+        items.append({
+            "ts": int(rec.get("ts") or 0),
+            "date": str(rec.get("date") or ""),
+            "provider": str(rec.get("provider") or ""),
+            "provider_name": str(rec.get("provider_name") or ""),
+            "model": str(rec.get("model") or ""),
+            "feature": str(rec.get("feature") or ""),
+            "conversation_id": str(rec.get("conversation_id") or ""),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "cost": compute_cost(rec.get("model"), prompt_tokens, completion_tokens, pricing, report_currency),
+            "estimated": bool(rec.get("estimated")),
+            "ok": bool(rec.get("ok", True)),
+            "error": str(rec.get("error") or ""),
+        })
+    return {
+        "range": _usage_range(start, end),
+        "currency": report_currency,
+        "total": len(all_records),
+        "limit": limit,
+        "offset": offset,
+        "items": items,
+    }
+
+@app.get("/api/usage/pricing")
+def get_usage_pricing():
+    """读单价表；文件不存在时返回内置默认价目表（source=default）。"""
+    pricing = load_model_pricing()
+    pricing["source"] = "file" if os.path.exists(MODEL_PRICING_PATH) else "default"
+    return pricing
+
+@app.post("/api/usage/pricing")
+async def post_usage_pricing(request: Request):
+    """保存单价表；写前自动备份成 model_pricing.backup-<ts>.json。"""
+    payload = await request.json()
+    if isinstance(payload, dict) and isinstance(payload.get("pricing"), dict):
+        payload = payload["pricing"]
+    data = save_model_pricing(payload if isinstance(payload, dict) else {})
+    return {"ok": True, "pricing": data}
+
+# 历史回填覆盖的只是 chat 类且带 raw_usage 的消息，覆盖率低，因此做成手动触发。
+_SOCRATIC_USAGE_BACKFILL_HINT = "仅回填历史会话里带 usage 的助手消息，按 会话+消息ID 去重。"
+
+@app.post("/api/usage/backfill")
+def backfill_usage():
+    """扫描历史会话，把带 raw_usage 的助手消息补写成 chat_history 流水（去重，可重复触发）。"""
+    existing = set()
+    for rec in iter_usage_records():
+        conversation_id = str(rec.get("conversation_id") or "")
+        request_id = str(rec.get("request_id") or "")
+        if conversation_id and request_id:
+            existing.add(conversation_id + "|" + request_id)
+    added = 0
+    scanned = 0
+    for path in glob.glob(os.path.join(CONVERSATION_DIR, "*", "*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                conversation = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(conversation, dict):
+            continue
+        conversation_id = str(conversation.get("id") or "")
+        for message in conversation.get("messages") or []:
+            if not isinstance(message, dict) or not message.get("raw_usage"):
+                continue
+            scanned += 1
+            request_id = str(message.get("id") or "")
+            key = conversation_id + "|" + request_id
+            if key in existing:
+                continue
+            existing.add(key)
+            record_llm_usage(
+                "",
+                message.get("model") or "",
+                "chat_history",
+                usage=message.get("raw_usage"),
+                conversation_id=conversation_id,
+                request_id=request_id,
+                prompt_text=str(message.get("content") or ""),
+                ts=message.get("created_at") or None,
+            )
+            added += 1
+    return {"ok": True, "hint": _SOCRATIC_USAGE_BACKFILL_HINT, "scanned": scanned, "added": added}
 
 # --- 历史记录 ---
 

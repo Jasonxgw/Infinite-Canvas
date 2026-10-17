@@ -1,5 +1,5 @@
 (function(){
-    const VERSION = '2026.09.25.script-studio.25';
+    const VERSION = '2026.10.16.clear.units.1';
     const scripts = [
         '/static/js/i18n-core.js',
         '/static/js/i18n/common.js',
@@ -9,6 +9,7 @@
         '/static/js/i18n/smart-canvas.js',
         '/static/js/i18n/comfyui-settings.js',
         '/static/js/i18n/script-studio.js',
+        '/static/js/i18n/usage.js',
     ];
     const tags = scripts.map(src => '<script src="' + src + '?v=' + VERSION + '"></script>').join('');
     if(document.readyState === 'loading' && document.currentScript){
